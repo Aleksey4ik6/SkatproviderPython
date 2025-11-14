@@ -1,47 +1,44 @@
-V.T. ISP Automation System
-A full-featured Internet Service Provider (ISP) management application built using Python and Tkinter. This modern desktop software allows ISPs to handle customer details, plans, billing, complaints, and troubleshooting in one place.
+Система автоматизации интернет-провайдеров
+Полнофункциональное приложение для управления интернет-провайдерами (ISP), созданное с использованием Python и Tkinter. Это современное программное обеспечение для настольных компьютеров позволяет интернет-провайдерам хранить данные о клиентах, тарифных планах, счетах, жалобах и устранении неполадок в одном месте.
 
-✨ Key Features
-Dashboard – Displays real-time statistics and recent activities.
+✨ Основные функции
+Панель управления — отображает статистику в реальном времени и последние действия.
 
-Customer Management – Add, update, or remove customer records easily.
+Управление клиентами — простое добавление, обновление или удаление записей о клиентах.
 
-Internet Plans – Manage service plans including speed, price, and data limit.
+Тарифные планы — управление тарифными планами, включая скорость, цену и лимит данных.
 
-Complaint System – Log, update, and resolve customer complaints.
+Система обработки жалоб — регистрируйте, обновляйте и решайте проблемы клиентов. 
 
-Billing Module – Generate bills, track payments, and mark them as paid or unpaid.
+ Модуль выставления счетов — формируйте счета, отслеживайте платежи и отмечайте их как оплаченные или неоплаченные. 
 
-Troubleshooting Guide – Helps users fix common internet issues with step-by-step instructions.
+ Руководство по устранению неполадок — помогает пользователям решать распространённые проблемы с интернетом с помощью пошаговых инструкций. 
 
-Technician Scheduling – Allows admin to schedule technician visits for customers.
+ Планирование визитов технических специалистов — позволяет администратору планировать визиты технических специалистов к клиентам. 
 
-Modern UI – Clean and intuitive interface using custom themed Tkinter widgets.
+ Современный пользовательский интерфейс — чистый и интуитивно понятный интерфейс с использованием виджетов Tkinter с пользовательской тематикой. 
 
-Local Database – Uses SQLite to store data persistently.
+ Локальная база данных — использует SQLite для постоянного хранения данных.
 
-📁 Project Structure
-ISP_SYSTEM.py – The main application file.
+📁 Структура проекта
+main.py – Основной файл приложения.
 
-isp_database.db – The SQLite database file (created automatically on first run).
+isp_database.db – Файл базы данных SQLite (создается автоматически при первом запуске).
 
-README.md – This documentation file.
+README.md – Этот файл документации.
 
-🧰 Built With
+🧰 Создан с использованием
 Python 3
 
-Tkinter (GUI)
+Tkinter (графический интерфейс)
 
-SQLite (Database)
+SQLite (база данных)
 
-👨‍💻 How to Use
-Make sure Python 3 is installed on your system.
+👨‍💻 как использовать
+Убедитесь, что в вашей системе установлен Python 3.
 
-Double-click ISP_SYSTEM.py or run it using Python to start the application.
+ Дважды щелкните файл ISP_SYSTEM.py или запустите его с помощью Python, чтобы запустить приложение.
 
-The system will create a local database file named isp_database.db automatically.
+ Система автоматически создаст локальный файл базы данных с именем isp_database.db.
 
-Use the tabs to manage customers, plans, complaints, and billing.
-
-🙋‍♂️ Author
-Developed by Vikash Tiwari
+ Используйте вкладки для управления клиентами, тарифными планами, жалобами и выставлением счетов.
