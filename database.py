@@ -1,73 +1,53 @@
-import sqlite3
+import mysql.connector
+from mysql.connector import Error
+import hashlib
 
-DB_NAME = "isp_database.db"
+# Configuration for MySQL
+DB_CONFIG = {
+    'host': 'localhost',
+    'user': 'root',
+    'password': 'root',  # ВАЖНО: Укажи свой пароль от БД
+    'database': 'isp_database'
+}
 
+def get_connection():
+    """Creates a connection to the MySQL database."""
+    try:
+        conn = mysql.connector.connect(**DB_CONFIG)
+        if conn.is_connected():
+            return conn
+    except Error as e:
+        print(f"Ошибка подключения к MySQL: {e}")
+        return None
 
-def get_connection(db_path: str = DB_NAME) -> sqlite3.Connection:
-    """
-    Создаёт подключение к БД и гарантирует наличие всех таблиц.
-    """
-    conn = sqlite3.connect(db_path)
-    create_tables(conn)
-    return conn
+def hash_password(password):
+    """Хеширует пароль алгоритмом SHA-256"""
+    return hashlib.sha256(password.encode()).hexdigest()
 
+def create_default_admin():
+    """Создает учетку admin:admin при первом запуске программы"""
+    conn = get_connection()
+    if conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM operators WHERE username = 'admin'")
+        if not cursor.fetchone():
+            sql = "INSERT INTO operators (username, password_hash, full_name) VALUES (%s, %s, %s)"
+            val = ('admin', hash_password('admin'), 'Главный Администратор')
+            cursor.execute(sql, val)
+            conn.commit()
+            print("Создан стандартный администратор: admin / admin")
+        cursor.close()
+        conn.close()
 
-def create_tables(conn: sqlite3.Connection) -> None:
-    """
-    Создаёт таблицы, если их ещё нет.
-    """
-    cursor = conn.cursor()
-
-    # Клиенты
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS customers (
-        customer_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        address TEXT NOT NULL,
-        phone TEXT NOT NULL,
-        email TEXT NOT NULL,
-        plan_id INTEGER,
-        registration_date TEXT,
-        FOREIGN KEY (plan_id) REFERENCES plans(plan_id)
-    )
-    ''')
-
-    # Тарифы
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS plans (
-        plan_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        speed TEXT NOT NULL,
-        price REAL NOT NULL,
-        data_limit TEXT,
-        description TEXT
-    )
-    ''')
-
-    # Обращения
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS complaints (
-        complaint_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        customer_id INTEGER NOT NULL,
-        description TEXT NOT NULL,
-        date TEXT NOT NULL,
-        status TEXT NOT NULL,
-        resolution TEXT,
-        FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
-    )
-    ''')
-
-    # Счета
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS billing (
-        bill_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        customer_id INTEGER NOT NULL,
-        amount REAL NOT NULL,
-        due_date TEXT NOT NULL,
-        paid INTEGER DEFAULT 0,
-        payment_date TEXT,
-        FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
-    )
-    ''')
-
-    conn.commit()
+def verify_login(username, password):
+    """Проверяет логин и пароль в БД"""
+    conn = get_connection()
+    if conn:
+        cursor = conn.cursor(dictionary=True)
+        hashed_pw = hash_password(password)
+        cursor.execute("SELECT * FROM operators WHERE username = %s AND password_hash = %s", (username, hashed_pw))
+        user = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        return user
+    return None
