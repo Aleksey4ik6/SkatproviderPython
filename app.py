@@ -32,7 +32,7 @@ class ISPAutomationSystem(ctk.CTk):
         # --- Боковое меню ---
         self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
-        self.sidebar_frame.grid_rowconfigure(9, weight=1)
+        self.sidebar_frame.grid_rowconfigure(10, weight=1)
 
         self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="СКАТ Провайдер",
                                        font=ctk.CTkFont(size=20, weight="bold"))
@@ -64,26 +64,36 @@ class ISPAutomationSystem(ctk.CTk):
                                       command=lambda: self.select_frame("troubleshooting"))
         self.btn_diag.grid(row=7, column=0, padx=20, pady=10)
 
+        self.btn_chat = ctk.CTkButton(self.sidebar_frame, text="Чаты", fg_color="#5a2ea6", hover_color="#6f3ad1",
+                                      command=lambda: self.select_frame("chat"))
+        self.btn_chat.grid(row=8, column=0, padx=20, pady=10)
+
         self.btn_ai = ctk.CTkButton(self.sidebar_frame, text="ИИ Ассистент", fg_color="#4B0082", hover_color="#800080",
                                     command=lambda: self.select_frame("ai_assistant"))
-        self.btn_ai.grid(row=8, column=0, padx=20, pady=20)
+        self.btn_ai.grid(row=9, column=0, padx=20, pady=20)
 
         # --- Основная область ---
         self.main_frame = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
         self.main_frame.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
 
         self.frames = {}
+        self.chat_poll_job = None
+        self.active_chat_customer_id = None
+        self.chat_cache = []
         self.create_dashboard_frame()
         self.create_customers_frame()
         self.create_plans_frame()
         self.create_complaints_frame()
         self.create_billing_frame()
         self.create_troubleshooting_frame()
+        self.create_chat_frame()
         self.create_ai_frame()
 
         self.select_frame("dashboard")
 
     def select_frame(self, name):
+        if name != "chat":
+            self.stop_chat_polling()
         for frame in self.frames.values(): frame.pack_forget()
         if name in self.frames:
             self.frames[name].pack(fill="both", expand=True)
@@ -99,6 +109,9 @@ class ISPAutomationSystem(ctk.CTk):
                 self.load_bills()
             elif name == "troubleshooting":
                 self.load_diag_customers()
+            elif name == "chat":
+                self.load_chat_customers()
+                self.start_chat_polling()
 
     # ==========================================
     # ДАШБОРД
@@ -221,19 +234,70 @@ class ISPAutomationSystem(ctk.CTk):
     def edit_customer_on_click(self, event):
         item_id = self.cust_tree.focus()
         if not item_id: return
-        item = self.cust_tree.item(item_id)
-        customer_id, current_name = item['values'][0], item['values'][1]
-        new_name = simpledialog.askstring("Редактирование", f"Новое ФИО для '{current_name}':",
-                                          initialvalue=current_name)
-        if new_name and new_name.strip() != "":
+        values = self.cust_tree.item(item_id)['values']
+        customer_id, name, addr, phone, ip, plan = values
+
+        # получаем email и plan_id из БД
+        cursor = self.conn.cursor(dictionary=True)
+        cursor.execute("SELECT email, plan_id FROM customers WHERE customer_id=%s", (customer_id,))
+        row = cursor.fetchone() or {"email": "", "plan_id": None}
+        cursor.close()
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT plan_id, name FROM plans")
+        plans = cursor.fetchall() or []
+        cursor.close()
+
+        modal = ctk.CTkToplevel(self)
+        modal.title("Редактирование клиента")
+        modal.geometry("520x360")
+        modal.resizable(False, False)
+
+        grid = ctk.CTkFrame(modal)
+        grid.pack(fill="both", expand=True, padx=20, pady=20)
+        labels = [("ФИО", name), ("Адрес", addr), ("Телефон", phone), ("Email", row["email"]), ("IP роутера", ip)]
+        entries = []
+        for idx, (label, value) in enumerate(labels):
+            ctk.CTkLabel(grid, text=label).grid(row=idx, column=0, sticky="w", pady=5)
+            ent = ctk.CTkEntry(grid, width=320)
+            ent.insert(0, value or "")
+            ent.grid(row=idx, column=1, sticky="ew", pady=5, padx=(10, 0))
+            entries.append(ent)
+        grid.grid_columnconfigure(1, weight=1)
+
+        plan_values = [f"{p[0]} - {p[1]}" for p in plans] or ["Планы не заданы"]
+        ctk.CTkLabel(grid, text="Тариф").grid(row=len(labels), column=0, sticky="w", pady=5)
+        plan_combo = ctk.CTkComboBox(grid, values=plan_values, width=320)
+        chosen = plan_values[0]
+        if row.get("plan_id"):
+            for pv in plan_values:
+                if pv.startswith(f"{row['plan_id']} -"):
+                    chosen = pv
+                    break
+        plan_combo.set(chosen)
+        plan_combo.grid(row=len(labels), column=1, sticky="ew", pady=5, padx=(10, 0))
+
+        def save():
+            new_name, new_addr, new_phone, new_email, new_ip = [e.get().strip() for e in entries]
+            plan_val = plan_combo.get()
+            plan_id = int(plan_val.split(' - ')[0]) if ' - ' in plan_val else None
             try:
                 cursor = self.conn.cursor()
-                cursor.execute("UPDATE customers SET name = %s WHERE customer_id = %s", (new_name, customer_id))
+                cursor.execute(
+                    "UPDATE customers SET name=%s, address=%s, phone=%s, email=%s, ip_address=%s, plan_id=%s WHERE customer_id=%s",
+                    (new_name, new_addr, new_phone, new_email, new_ip, plan_id, customer_id))
                 self.conn.commit()
                 cursor.close()
                 self.load_customers()
+                modal.destroy()
             except Exception as e:
                 messagebox.showerror("Ошибка", str(e))
+
+        btn_row = ctk.CTkFrame(modal, fg_color="transparent")
+        btn_row.pack(fill="x", padx=20, pady=(10, 10))
+        btn_row.grid_columnconfigure((0, 1), weight=1, uniform="btns")
+        ctk.CTkButton(btn_row, text="Сохранить", fg_color="#1f6aa5", command=save).grid(row=0, column=0, padx=6)
+        ctk.CTkButton(btn_row, text="Отмена", command=modal.destroy).grid(row=0, column=1, padx=6)
 
     # ==========================================
     # ТАРИФЫ
@@ -254,6 +318,7 @@ class ISPAutomationSystem(ctk.CTk):
         columns = ('id', 'name', 'speed', 'price')
         self.plans_tree = ttk.Treeview(frame, columns=columns, show='headings')
         for col in columns: self.plans_tree.heading(col, text=col.upper())
+        self.plans_tree.bind("<Double-1>", self.edit_plan_on_click)
         self.plans_tree.pack(fill="both", expand=True)
 
     def load_plans(self):
@@ -275,6 +340,59 @@ class ISPAutomationSystem(ctk.CTk):
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
 
+    def edit_plan_on_click(self, event):
+        sel = self.plans_tree.selection()
+        if not sel: return
+        plan_id = self.plans_tree.item(sel[0])['values'][0]
+        cursor = self.conn.cursor(dictionary=True)
+        cursor.execute("SELECT * FROM plans WHERE plan_id=%s", (plan_id,))
+        plan = cursor.fetchone()
+        cursor.close()
+        if not plan: return
+
+        modal = ctk.CTkToplevel(self)
+        modal.title("Редактирование тарифа")
+        modal.geometry("480x360")
+        modal.resizable(False, False)
+
+        form = ctk.CTkFrame(modal)
+        form.pack(fill="both", expand=True, padx=20, pady=20)
+        fields = [
+            ("Название", "name"),
+            ("Скорость", "speed"),
+            ("Цена", "price"),
+            ("Лимит данных", "data_limit"),
+            ("Описание", "description"),
+        ]
+        entries = {}
+        for i, (label, key) in enumerate(fields):
+            ctk.CTkLabel(form, text=label).grid(row=i, column=0, sticky="w", pady=5)
+            ent = ctk.CTkEntry(form, width=320)
+            ent.insert(0, plan.get(key) or "")
+            ent.grid(row=i, column=1, sticky="ew", pady=5, padx=(10, 0))
+            entries[key] = ent
+        form.grid_columnconfigure(1, weight=1)
+
+        def save():
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "UPDATE plans SET name=%s, speed=%s, price=%s, data_limit=%s, description=%s WHERE plan_id=%s",
+                    (entries["name"].get(), entries["speed"].get(), float(entries["price"].get() or 0),
+                     entries["data_limit"].get(), entries["description"].get(), plan_id)
+                )
+                self.conn.commit()
+                cursor.close()
+                self.load_plans()
+                modal.destroy()
+            except Exception as e:
+                messagebox.showerror("Ошибка", str(e))
+
+        btns = ctk.CTkFrame(modal, fg_color="transparent")
+        btns.pack(pady=(0, 10))
+        ctk.CTkButton(btns, text="Сохранить", fg_color="#1f6aa5", command=save, width=140).pack(side="left", padx=8)
+        ctk.CTkButton(btns, text="Отмена", command=modal.destroy, width=120).pack(side="left")
+
     # ==========================================
     # ОБРАЩЕНИЯ
     # ==========================================
@@ -291,6 +409,7 @@ class ISPAutomationSystem(ctk.CTk):
         columns = ('id', 'customer', 'desc', 'status', 'date')
         self.comp_tree = ttk.Treeview(frame, columns=columns, show='headings')
         for col in columns: self.comp_tree.heading(col, text=col.upper())
+        self.comp_tree.bind("<Double-1>", self.edit_complaint_on_click)
         self.comp_tree.pack(fill="both", expand=True)
 
     def load_complaints(self):
@@ -313,6 +432,49 @@ class ISPAutomationSystem(ctk.CTk):
         self.conn.commit()
         cursor.close()
         self.load_complaints()
+
+    def edit_complaint_on_click(self, event):
+        sel = self.comp_tree.selection()
+        if not sel: return
+        values = self.comp_tree.item(sel[0])['values']
+        comp_id, customer_name, desc, status, date = values
+
+        modal = ctk.CTkToplevel(self)
+        modal.title("Редактирование обращения")
+        modal.geometry("520x320")
+        modal.resizable(False, False)
+
+        form = ctk.CTkFrame(modal)
+        form.pack(fill="both", expand=True, padx=20, pady=20)
+        ctk.CTkLabel(form, text=f"Клиент: {customer_name}").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
+
+        ctk.CTkLabel(form, text="Описание").grid(row=1, column=0, sticky="nw", pady=5)
+        desc_box = ctk.CTkTextbox(form, height=100, wrap="word")
+        desc_box.insert("0.0", desc)
+        desc_box.grid(row=1, column=1, sticky="nsew", pady=5, padx=(10, 0))
+
+        ctk.CTkLabel(form, text="Статус").grid(row=2, column=0, sticky="w", pady=10)
+        status_combo = ctk.CTkComboBox(form, values=["Открыто", "В работе", "Решено"], width=200)
+        status_combo.set(status)
+        status_combo.grid(row=2, column=1, sticky="w", pady=10, padx=(10, 0))
+
+        form.grid_columnconfigure(1, weight=1)
+
+        def save():
+            new_desc = desc_box.get("0.0", "end").strip()
+            new_status = status_combo.get()
+            cursor = self.conn.cursor()
+            cursor.execute("UPDATE complaints SET description=%s, status=%s WHERE complaint_id=%s",
+                           (new_desc, new_status, comp_id))
+            self.conn.commit()
+            cursor.close()
+            self.load_complaints()
+            modal.destroy()
+
+        btns = ctk.CTkFrame(modal, fg_color="transparent")
+        btns.pack(pady=(0, 10))
+        ctk.CTkButton(btns, text="Сохранить", fg_color="#1f6aa5", command=save, width=140).pack(side="left", padx=8)
+        ctk.CTkButton(btns, text="Отмена", command=modal.destroy, width=120).pack(side="left")
 
     # ==========================================
     # СЧЕТА
@@ -396,6 +558,138 @@ class ISPAutomationSystem(ctk.CTk):
         cursor.execute("SELECT customer_id, name, ip_address FROM customers")
         self.diag_cust_combo.configure(values=[f"{c[0]} - {c[1]} [IP: {c[2]}]" for c in cursor.fetchall()])
         cursor.close()
+
+    # ==========================================
+    # ЧАТ С КЛИЕНТАМИ
+    # ==========================================
+    def create_chat_frame(self):
+        frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.frames["chat"] = frame
+
+        ctk.CTkLabel(frame, text="Чаты с клиентами", font=ctk.CTkFont(size=22, weight="bold")).pack(anchor="w",
+                                                                                                    pady=(0, 10))
+        container = ctk.CTkFrame(frame)
+        container.pack(fill="both", expand=True)
+        container.grid_columnconfigure(1, weight=1)
+        container.grid_rowconfigure(0, weight=1)
+
+        # Список клиентов слева
+        self.chat_tree = ttk.Treeview(container, columns=('name', 'phone', 'unread'), show='headings', height=25)
+        self.chat_tree.heading('name', text='Клиент')
+        self.chat_tree.heading('phone', text='Телефон')
+        self.chat_tree.heading('unread', text='Непр.')
+        self.chat_tree.column('name', width=160)
+        self.chat_tree.column('phone', width=110)
+        self.chat_tree.column('unread', width=60, anchor='center')
+        self.chat_tree.bind("<<TreeviewSelect>>", self.on_select_chat_customer)
+        self.chat_tree.grid(row=0, column=0, sticky="ns", padx=(0, 10), pady=5)
+
+        # Область переписки
+        chat_panel = ctk.CTkFrame(container)
+        chat_panel.grid(row=0, column=1, sticky="nsew")
+        chat_panel.grid_rowconfigure(0, weight=1)
+        chat_panel.grid_columnconfigure(0, weight=1)
+
+        self.chat_messages_frame = ctk.CTkScrollableFrame(chat_panel, fg_color="#1f1f28")
+        self.chat_messages_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
+
+        input_row = ctk.CTkFrame(chat_panel, fg_color="transparent")
+        input_row.grid(row=1, column=0, sticky="ew", padx=5, pady=(5, 10))
+        input_row.grid_columnconfigure(0, weight=1)
+        self.chat_entry = ctk.CTkEntry(input_row, placeholder_text="Сообщение клиенту...", height=38)
+        self.chat_entry.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        send_btn = ctk.CTkButton(input_row, text="Отправить", fg_color="#5a2ea6", command=self.send_chat_message)
+        send_btn.grid(row=0, column=1)
+
+        self.chat_hint = ctk.CTkLabel(self.chat_messages_frame, text="Выберите клиента слева", text_color="gray")
+        self.chat_hint.pack(pady=10)
+
+    def load_chat_customers(self):
+        conn = database.get_connection()
+        if not conn:
+            return
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT c.customer_id, c.name, c.phone,
+                   SUM(CASE WHEN m.is_read = 0 AND m.sender_type = 'client' THEN 1 ELSE 0 END) AS unread
+            FROM customers c
+            LEFT JOIN messages m ON c.customer_id = m.customer_id
+            GROUP BY c.customer_id, c.name, c.phone
+            ORDER BY unread DESC, c.name
+        """)
+        rows = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        for item in self.chat_tree.get_children():
+            self.chat_tree.delete(item)
+        for row in rows:
+            self.chat_tree.insert('', 'end', iid=row["customer_id"], values=(row["name"], row["phone"], row["unread"] or 0))
+
+    def on_select_chat_customer(self, event):
+        selection = self.chat_tree.selection()
+        if not selection:
+            return
+        customer_id = int(selection[0])
+        values = self.chat_tree.item(selection[0], "values")
+        self.active_chat_customer_id = customer_id
+        self.active_chat_name = values[0] if values else "Клиент"
+        self.load_chat_messages()
+
+    def load_chat_messages(self):
+        if not self.active_chat_customer_id:
+            return
+        messages = database.fetch_messages(self.active_chat_customer_id)
+        self.chat_cache = messages
+        self.render_chat_messages(messages)
+        database.mark_messages_read(self.active_chat_customer_id, "support")
+        self.load_chat_customers()
+
+    def render_chat_messages(self, messages):
+        for widget in self.chat_messages_frame.winfo_children():
+            widget.destroy()
+        if not messages:
+            self.chat_hint = ctk.CTkLabel(self.chat_messages_frame, text="Пока нет сообщений", text_color="gray")
+            self.chat_hint.pack(pady=10)
+            return
+        for msg in messages:
+            align = "e" if msg["sender_type"] == "support" else "w"
+            bubble = ctk.CTkFrame(self.chat_messages_frame, fg_color="#4b4b5a" if msg["sender_type"] == "client" else "#5a2ea6", corner_radius=10)
+            bubble.pack(fill="x", pady=4, padx=6, anchor=align)
+            author = msg["sender_name"] or ("Клиент" if msg["sender_type"] == "client" else "Оператор")
+            ctk.CTkLabel(bubble, text=author, font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=8, pady=(6, 0))
+            ctk.CTkLabel(bubble, text=msg["text"], wraplength=700, justify="left").pack(anchor="w", padx=8, pady=4)
+            ts = msg["created_at"].strftime("%d.%m %H:%M") if isinstance(msg["created_at"], datetime) else str(msg["created_at"])
+            ctk.CTkLabel(bubble, text=ts, text_color="lightgray", font=ctk.CTkFont(size=10)).pack(anchor="e", padx=8, pady=(0, 6))
+
+    def send_chat_message(self):
+        if not self.active_chat_customer_id:
+            messagebox.showinfo("Нет клиента", "Выберите клиента слева.")
+            return
+        text = self.chat_entry.get().strip()
+        if not text:
+            return
+        database.save_message(self.active_chat_customer_id, "support", text, self.operator.get("full_name"))
+        self.chat_entry.delete(0, "end")
+        self.load_chat_messages()
+
+    def start_chat_polling(self):
+        self.stop_chat_polling()
+        def poll():
+            if self.active_chat_customer_id:
+                latest = database.fetch_messages(self.active_chat_customer_id)
+                if len(latest) != len(self.chat_cache):
+                    self.chat_cache = latest
+                    self.render_chat_messages(latest)
+                    database.mark_messages_read(self.active_chat_customer_id, "support")
+                    self.load_chat_customers()
+            self.chat_poll_job = self.after(3000, poll)
+        self.chat_poll_job = self.after(3000, poll)
+
+    def stop_chat_polling(self):
+        if self.chat_poll_job:
+            self.after_cancel(self.chat_poll_job)
+            self.chat_poll_job = None
 
     def start_diag_thread(self):
         cust_str = self.diag_cust_combo.get()
