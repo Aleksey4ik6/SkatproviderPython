@@ -26,6 +26,7 @@ class MobileAppPrototype(ctk.CTk):
         self.messages_cache = []
         self.chat_poll_job = None
         self.home_poll_job = None
+        self.autopay_enabled = 0
 
         self.frames = {}
         self.create_login_screen()
@@ -99,15 +100,36 @@ class MobileAppPrototype(ctk.CTk):
         quick = ctk.CTkFrame(outer, fg_color=CARD)
         quick.pack(fill="x", padx=12, pady=6)
         quick.grid_columnconfigure((0, 1, 2), weight=1, uniform="q")
-        labels = ["Финансы", "Обещанный\nплатеж", "Автоплатеж"]
-        for i, label in enumerate(labels):
-            ctk.CTkButton(quick, text=label, fg_color="#2a2a36", height=36).grid(row=0, column=i, padx=6, pady=10, sticky="ew")
+        self.btn_finance = ctk.CTkButton(quick, text="Финансы", fg_color="#2a2a36", height=36,
+                                         command=self.show_finance_info)
+        self.btn_finance.grid(row=0, column=0, padx=6, pady=10, sticky="ew")
+        self.btn_promised = ctk.CTkButton(quick, text="Обещанный\nплатеж", fg_color="#2a2a36", height=36,
+                                          command=self.request_promised_payment)
+        self.btn_promised.grid(row=0, column=1, padx=6, pady=10, sticky="ew")
+        self.btn_autopay = ctk.CTkButton(quick, text="Автоплатеж\nOFF", fg_color="#2a2a36", height=36,
+                                         command=self.toggle_autopay)
+        self.btn_autopay.grid(row=0, column=2, padx=6, pady=10, sticky="ew")
 
         self.services_card = ctk.CTkFrame(outer, fg_color=CARD)
         self.services_card.pack(fill="x", padx=12, pady=6)
         ctk.CTkLabel(self.services_card, text="Мои услуги", font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=10, pady=(8, 4))
         self.services_body = ctk.CTkLabel(self.services_card, text="", justify="left")
         self.services_body.pack(anchor="w", padx=10, pady=(0, 10))
+
+        actions = ctk.CTkFrame(outer, fg_color=CARD)
+        actions.pack(fill="x", padx=12, pady=6)
+        actions.grid_columnconfigure((0, 1), weight=1, uniform="act")
+        ctk.CTkButton(actions, text="Сменить тариф", fg_color=ACCENT, command=self.request_plan_change).grid(
+            row=0, column=0, padx=6, pady=10, sticky="ew")
+        ctk.CTkButton(actions, text="Подключить услугу", fg_color="#2a2a36", command=self.request_addon).grid(
+            row=0, column=1, padx=6, pady=10, sticky="ew")
+
+        self.requests_card = ctk.CTkFrame(outer, fg_color=CARD)
+        self.requests_card.pack(fill="x", padx=12, pady=6)
+        ctk.CTkLabel(self.requests_card, text="Мои заявки", font=ctk.CTkFont(size=16, weight="bold")).pack(
+            anchor="w", padx=10, pady=(8, 4))
+        self.requests_body = ctk.CTkLabel(self.requests_card, text="Заявок пока нет", justify="left", wraplength=310)
+        self.requests_body.pack(anchor="w", padx=10, pady=(0, 10))
 
     def create_chat_screen(self):
         frame = ctk.CTkFrame(self, fg_color=BG_DARK)
@@ -157,6 +179,11 @@ class MobileAppPrototype(ctk.CTk):
         if next_due:
             due_text += f"\nдо {next_due}"
         self.lbl_due.configure(text=due_text)
+        self.autopay_enabled = database.get_customer_autopay(cid)
+        self.btn_autopay.configure(
+            text=f"Автоплатеж\n{'ON' if self.autopay_enabled else 'OFF'}",
+            fg_color="#1f6a3a" if self.autopay_enabled else "#2a2a36"
+        )
 
         # тариф/услуги
         conn = database.get_connection()
@@ -178,6 +205,26 @@ class MobileAppPrototype(ctk.CTk):
                 text=f"Домашний интернет\nТариф: {plan['name']}\nСкорость: {plan.get('speed')}\nСтоимость: {plan.get('price')} ₽")
         else:
             self.services_body.configure(text="Услуги не назначены")
+
+        requests_rows = database.get_customer_self_service_requests(cid, limit=5)
+        if not requests_rows:
+            self.requests_body.configure(text="Заявок пока нет")
+        else:
+            type_map = {
+                "promised_payment": "Обещанный платеж",
+                "plan_change": "Смена тарифа",
+                "addon": "Доп. услуга",
+                "autopay": "Автоплатеж"
+            }
+            lines = []
+            for r in requests_rows:
+                title = type_map.get(r.get("request_type"), r.get("request_type"))
+                status = r.get("status") or "Новая"
+                line = f"#{r.get('request_id')} {title}: {status}"
+                if r.get("comment"):
+                    line += f" ({r.get('comment')})"
+                lines.append(line)
+            self.requests_body.configure(text="\n".join(lines))
 
     def render_chat(self, messages):
         for w in self.chat_area.winfo_children():
@@ -249,6 +296,94 @@ class MobileAppPrototype(ctk.CTk):
 
     def fake_pay(self):
         messagebox.showinfo("Пополнение", "Переход к оплате (заглушка).")
+
+    def show_finance_info(self):
+        if not self.customer:
+            return
+        finance = database.get_customer_finance_summary(self.customer["customer_id"])
+        due = finance.get("due") or 0
+        next_due = finance.get("next_due")
+        text = f"К оплате: {due} ₽"
+        if next_due:
+            text += f"\nСрок оплаты: {next_due}"
+        text += f"\nАвтоплатеж: {'включен' if self.autopay_enabled else 'выключен'}"
+        messagebox.showinfo("Финансы", text)
+
+    def request_promised_payment(self):
+        if not self.customer:
+            return
+        amount_dialog = ctk.CTkInputDialog(text="Сумма обещанного платежа (₽):", title="Обещанный платеж")
+        amount = (amount_dialog.get_input() or "").strip()
+        if not amount:
+            return
+        days_dialog = ctk.CTkInputDialog(text="На сколько дней отсрочка (напр. 5):", title="Обещанный платеж")
+        days = (days_dialog.get_input() or "").strip()
+        if not days:
+            days = "5"
+        payload = {"amount": amount, "days": days}
+        req_id = database.create_self_service_request(self.customer["customer_id"], "promised_payment", payload,
+                                                      actor_name=self.customer.get("name") or "Клиент")
+        messagebox.showinfo("Готово", f"Заявка #{req_id} на обещанный платеж отправлена в поддержку.")
+
+    def toggle_autopay(self):
+        if not self.customer:
+            return
+        new_state = 0 if self.autopay_enabled else 1
+        database.set_customer_autopay(self.customer["customer_id"], new_state, actor_name=self.customer.get("name") or "Клиент")
+        self.autopay_enabled = new_state
+        self.btn_autopay.configure(
+            text=f"Автоплатеж\n{'ON' if self.autopay_enabled else 'OFF'}",
+            fg_color="#1f6a3a" if self.autopay_enabled else "#2a2a36"
+        )
+        messagebox.showinfo("Автоплатеж", f"Автоплатеж {'включен' if new_state else 'выключен'}.")
+
+    def request_plan_change(self):
+        if not self.customer:
+            return
+        plans = database.get_available_plans()
+        if not plans:
+            messagebox.showwarning("Тарифы", "Нет доступных тарифов.")
+            return
+
+        modal = ctk.CTkToplevel(self)
+        modal.title("Смена тарифа")
+        modal.geometry("340x220")
+        modal.resizable(False, False)
+        ctk.CTkLabel(modal, text="Выберите новый тариф", font=ctk.CTkFont(size=15, weight="bold")).pack(pady=(15, 8))
+        values = [f"{p['plan_id']} - {p['name']} ({p['speed']}, {p['price']} ₽)" for p in plans]
+        combo = ctk.CTkComboBox(modal, values=values, width=300)
+        combo.set(values[0])
+        combo.pack(pady=8)
+
+        def submit():
+            selected = combo.get()
+            plan_id = int(selected.split(" - ")[0]) if " - " in selected else None
+            req_id = database.create_self_service_request(
+                self.customer["customer_id"], "plan_change",
+                {"target_plan_id": plan_id, "selected": selected},
+                actor_name=self.customer.get("name") or "Клиент"
+            )
+            modal.destroy()
+            messagebox.showinfo("Готово", f"Заявка #{req_id} на смену тарифа отправлена.")
+
+        ctk.CTkButton(modal, text="Отправить заявку", fg_color=ACCENT, command=submit).pack(pady=12)
+        ctk.CTkButton(modal, text="Отмена", fg_color="#2a2a36", command=modal.destroy).pack()
+
+    def request_addon(self):
+        if not self.customer:
+            return
+        addon_dialog = ctk.CTkInputDialog(
+            text="Какую услугу хотите подключить? (например: Белый IP, Антивирус)",
+            title="Подключение услуги"
+        )
+        addon = (addon_dialog.get_input() or "").strip()
+        if not addon:
+            return
+        req_id = database.create_self_service_request(
+            self.customer["customer_id"], "addon", {"service": addon},
+            actor_name=self.customer.get("name") or "Клиент"
+        )
+        messagebox.showinfo("Готово", f"Заявка #{req_id} на подключение услуги отправлена.")
 
 
 if __name__ == "__main__":
