@@ -9,6 +9,10 @@ import requests
 import time
 import re
 import json
+import os
+import io
+import math
+from PIL import Image, ImageTk
 
 # Настройки темы
 ctk.set_appearance_mode("System")
@@ -26,6 +30,11 @@ class ISPAutomationSystem(ctk.CTk):
         self.conn = database.get_connection()
         if self.conn is None:
             messagebox.showerror("Ошибка БД", "Не удалось подключиться к базе данных. Проверьте database.py")
+        self.selected_house_id = None
+        self.selected_lat = None
+        self.selected_lon = None
+        if self.conn:
+            self.ensure_geo_schema()
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -261,6 +270,11 @@ class ISPAutomationSystem(ctk.CTk):
         self.cust_name.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
         self.cust_address = ctk.CTkEntry(form_frame, placeholder_text="Адрес")
         self.cust_address.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
+        self.btn_address_api = ctk.CTkButton(form_frame, text="API адрес", width=90, command=self.open_address_picker)
+        self.btn_address_api.grid(row=0, column=3, padx=(0, 10), pady=10, sticky="ew")
+        self.btn_bulk_geo = ctk.CTkButton(form_frame, text="Обновить старые адреса", width=150,
+                                          command=self.backfill_customer_addresses)
+        self.btn_bulk_geo.grid(row=1, column=3, padx=(0, 10), pady=10, sticky="ew")
         self.cust_phone = ctk.CTkEntry(form_frame, placeholder_text="Телефон")
         self.cust_phone.grid(row=0, column=2, padx=10, pady=10, sticky="ew")
         self.cust_email = ctk.CTkEntry(form_frame, placeholder_text="Email")
@@ -271,7 +285,10 @@ class ISPAutomationSystem(ctk.CTk):
         self.cust_plan.grid(row=1, column=2, padx=10, pady=10, sticky="ew")
         btn_add = ctk.CTkButton(form_frame, text="Добавить клиента", command=self.add_customer)
         btn_add.grid(row=2, column=1, padx=10, pady=10)
+        self.cust_addr_info = ctk.CTkLabel(form_frame, text="Адрес не выбран через API", text_color="gray")
+        self.cust_addr_info.grid(row=2, column=0, padx=10, pady=10, sticky="w")
         form_frame.grid_columnconfigure((0, 1, 2), weight=1)
+        form_frame.grid_columnconfigure(3, weight=0)
 
         filter_frame = ctk.CTkFrame(frame)
         filter_frame.pack(fill="x", pady=(0, 10))
@@ -313,15 +330,228 @@ class ISPAutomationSystem(ctk.CTk):
         try:
             cursor = self.conn.cursor()
             cursor.execute(
-                "INSERT INTO customers (name, address, phone, email, ip_address, plan_id, registration_date) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                (name, address, phone, email, ip_addr, plan_id, datetime.now()))
+                "INSERT INTO customers (name, address, phone, email, ip_address, plan_id, registration_date, house_id, latitude, longitude) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                (name, address, phone, email, ip_addr, plan_id, datetime.now(),
+                 self.selected_house_id, self.selected_lat, self.selected_lon))
             customer_id = cursor.lastrowid
             self.conn.commit()
             cursor.close()
             self.log_customer_event(customer_id, "Профиль", f"Создан клиент {name}")
+            self.selected_house_id = None
+            self.selected_lat = None
+            self.selected_lon = None
+            self.cust_addr_info.configure(text="Адрес не выбран через API", text_color="gray")
             self.load_customers()
         except Exception as e:
             messagebox.showerror("Ошибка", str(e))
+
+    def ensure_geo_schema(self):
+        cursor = self.conn.cursor()
+        # City houses directory
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS city_houses (
+                house_id INT AUTO_INCREMENT PRIMARY KEY,
+                city VARCHAR(80) NOT NULL DEFAULT 'Абакан',
+                street VARCHAR(255),
+                house_number VARCHAR(60),
+                full_address VARCHAR(255) NOT NULL,
+                latitude DECIMAL(10, 7),
+                longitude DECIMAL(10, 7),
+                created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE KEY uq_city_houses_full_address (full_address),
+                INDEX idx_city_houses_latlon (latitude, longitude)
+            )
+        """)
+        # House incidents used by city map
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS house_incidents (
+                incident_id INT AUTO_INCREMENT PRIMARY KEY,
+                house_id INT NOT NULL,
+                title VARCHAR(255) NOT NULL,
+                severity VARCHAR(20) NOT NULL DEFAULT 'Средняя',
+                status VARCHAR(20) NOT NULL DEFAULT 'Активна',
+                description TEXT,
+                started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                resolved_at DATETIME,
+                FOREIGN KEY (house_id) REFERENCES city_houses(house_id),
+                INDEX idx_house_incidents_status (house_id, status),
+                INDEX idx_house_incidents_started (started_at)
+            )
+        """)
+        # Extend customers table if needed
+        for sql in [
+            "ALTER TABLE customers ADD COLUMN house_id INT NULL",
+            "ALTER TABLE customers ADD COLUMN latitude DECIMAL(10, 7) NULL",
+            "ALTER TABLE customers ADD COLUMN longitude DECIMAL(10, 7) NULL",
+            "ALTER TABLE customers ADD INDEX idx_customers_house_id (house_id)",
+        ]:
+            try:
+                cursor.execute(sql)
+            except Exception:
+                pass
+        self.conn.commit()
+        cursor.close()
+
+    def open_address_picker(self):
+        modal = self.open_modal("Подбор адреса (API)", "760x520")
+        layout = ctk.CTkFrame(modal)
+        layout.pack(fill="both", expand=True, padx=16, pady=16)
+        layout.grid_columnconfigure(0, weight=1)
+        layout.grid_rowconfigure(2, weight=1)
+
+        ctk.CTkLabel(layout, text="Запрос адреса (например: Абакан, Ленина 12)").grid(row=0, column=0, sticky="w")
+        query_entry = ctk.CTkEntry(layout, height=36)
+        query_entry.insert(0, self.cust_address.get().strip() or "Абакан, ")
+        query_entry.grid(row=1, column=0, sticky="ew", pady=(4, 8))
+
+        results_tree = ttk.Treeview(layout, columns=("address", "lat", "lon"), show="headings")
+        results_tree.heading("address", text="Адрес")
+        results_tree.heading("lat", text="Lat")
+        results_tree.heading("lon", text="Lon")
+        results_tree.column("address", width=520)
+        results_tree.column("lat", width=90)
+        results_tree.column("lon", width=90)
+        results_tree.grid(row=2, column=0, sticky="nsew")
+
+        state = {"rows": []}
+
+        def search():
+            q = query_entry.get().strip()
+            if not q:
+                return
+            try:
+                rows = self.geocode_search(q, limit=15)
+            except Exception as e:
+                messagebox.showerror("API адресов", f"Ошибка запроса: {e}")
+                return
+            state["rows"] = rows
+            for item in results_tree.get_children():
+                results_tree.delete(item)
+            for idx, r in enumerate(rows):
+                address = r.get("display_name", "")
+                lat = r.get("lat", "")
+                lon = r.get("lon", "")
+                results_tree.insert("", "end", iid=str(idx), values=(address[:180], lat, lon))
+
+        def choose():
+            sel = results_tree.selection()
+            if not sel:
+                messagebox.showinfo("Адрес", "Выберите адрес из списка.")
+                return
+            row = state["rows"][int(sel[0])]
+            full_address = row.get("display_name", "").strip()
+            lat = float(row.get("lat", 0) or 0)
+            lon = float(row.get("lon", 0) or 0)
+            house_id = self.upsert_city_house(full_address, lat, lon, row.get("address", {}))
+            self.selected_house_id = house_id
+            self.selected_lat = lat
+            self.selected_lon = lon
+            self.cust_address.delete(0, "end")
+            self.cust_address.insert(0, full_address)
+            self.cust_addr_info.configure(text=f"Дом #{house_id}, координаты: {lat:.5f}, {lon:.5f}", text_color="#7ecf9a")
+            modal.destroy()
+
+        actions = ctk.CTkFrame(layout, fg_color="transparent")
+        actions.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        ctk.CTkButton(actions, text="Найти", command=search).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="Выбрать адрес", fg_color="#1f6aa5", command=choose).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="Отмена", command=modal.destroy).pack(side="left")
+
+    def geocode_search(self, query, limit=10):
+        headers = {"User-Agent": "AlekseySkat-ISP/1.0 (desktop app)"}
+        q = query.strip()
+        if "абакан" not in q.lower():
+            q = f"{q}, Абакан"
+        params = {
+            "q": q,
+            "format": "jsonv2",
+            "addressdetails": 1,
+            "limit": limit,
+            "countrycodes": "ru",
+        }
+        resp = requests.get("https://nominatim.openstreetmap.org/search", params=params, headers=headers, timeout=12)
+        resp.raise_for_status()
+        return resp.json()
+
+    def upsert_city_house(self, full_address, lat, lon, addr_meta):
+        street = addr_meta.get("road") or addr_meta.get("street") or addr_meta.get("pedestrian") or ""
+        house_number = addr_meta.get("house_number") or ""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT INTO city_houses (city, street, house_number, full_address, latitude, longitude, created_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s, %s) "
+            "ON DUPLICATE KEY UPDATE street=VALUES(street), house_number=VALUES(house_number), latitude=VALUES(latitude), longitude=VALUES(longitude)",
+            ("Абакан", street, house_number, full_address, lat, lon, datetime.now()))
+        self.conn.commit()
+        cursor.execute("SELECT house_id FROM city_houses WHERE full_address=%s", (full_address,))
+        row = cursor.fetchone()
+        cursor.close()
+        return row[0] if row else None
+
+    def backfill_customer_addresses(self):
+        if not self.conn:
+            return
+        confirm = messagebox.askyesno("Нормализация адресов",
+                                      "Обновить координаты/house_id для старых клиентов без геопривязки?\nЭто может занять время.")
+        if not confirm:
+            return
+        cursor = self.conn.cursor(dictionary=True)
+        cursor.execute("SELECT customer_id, address FROM customers WHERE (house_id IS NULL OR latitude IS NULL OR longitude IS NULL) AND address IS NOT NULL AND address != ''")
+        rows = cursor.fetchall()
+        cursor.close()
+        if not rows:
+            messagebox.showinfo("Нормализация", "Нет клиентов для обновления.")
+            return
+
+        progress = self.open_modal("Нормализация адресов", "640x420")
+        box = ctk.CTkFrame(progress)
+        box.pack(fill="both", expand=True, padx=16, pady=16)
+        ctk.CTkLabel(box, text=f"Клиентов к обработке: {len(rows)}").pack(anchor="w", pady=(0, 8))
+        log = ctk.CTkTextbox(box, height=280)
+        log.pack(fill="both", expand=True)
+        bar = ctk.CTkProgressBar(box)
+        bar.pack(fill="x", pady=(8, 0))
+        bar.set(0)
+        progress.update()
+
+        success = 0
+        failed = 0
+        for idx, r in enumerate(rows, start=1):
+            cid = r["customer_id"]
+            addr = (r["address"] or "").strip()
+            try:
+                found = self.geocode_search(addr, limit=1)
+                if not found:
+                    failed += 1
+                    log.insert("end", f"[{idx}] CID {cid}: не найдено -> {addr}\n")
+                else:
+                    geo = found[0]
+                    full_address = geo.get("display_name", addr)
+                    lat = float(geo.get("lat"))
+                    lon = float(geo.get("lon"))
+                    house_id = self.upsert_city_house(full_address, lat, lon, geo.get("address", {}))
+                    cur = self.conn.cursor()
+                    cur.execute("UPDATE customers SET address=%s, house_id=%s, latitude=%s, longitude=%s WHERE customer_id=%s",
+                                (full_address, house_id, lat, lon, cid))
+                    self.conn.commit()
+                    cur.close()
+                    success += 1
+                    log.insert("end", f"[{idx}] CID {cid}: OK -> house_id {house_id}\n")
+                progress.update()
+            except Exception as e:
+                failed += 1
+                log.insert("end", f"[{idx}] CID {cid}: ошибка -> {e}\n")
+                progress.update()
+            bar.set(idx / len(rows))
+            progress.update()
+            time.sleep(1.0)  # polite rate for Nominatim
+
+        log.insert("end", f"\nГотово. Успешно: {success}, ошибок: {failed}\n")
+        messagebox.showinfo("Нормализация завершена", f"Успешно: {success}\nОшибок: {failed}")
+        progress.destroy()
+        self.load_customers()
+        self.load_network_map_data()
 
     def edit_customer_on_click(self, event):
         item_id = self.cust_tree.focus()
@@ -1594,6 +1824,544 @@ class ISPAutomationSystem(ctk.CTk):
         cursor.close()
         for cid in customer_ids:
             self.log_customer_event(cid, "Диагностика", details)
+
+    # ---- New city-house based map (overrides node-based methods above) ----
+    def create_network_map_frame(self):
+        frame = ctk.CTkFrame(self.main_frame, fg_color="transparent")
+        self.frames["network_map"] = frame
+        self.network_map_zoom = 13
+        self.network_map_center = None
+        self.network_map_photo = None
+        self.network_map_last_params = None
+        self.network_map_resize_job = None
+        self.network_map_draw_job = None
+        self.network_map_drag_last = None
+        self.network_map_drag_accum_dx = 0
+        self.network_map_drag_accum_dy = 0
+        self.network_map_image_cache = {}
+        self.network_map_loading_keys = set()
+        self.network_map_current_key = None
+
+        ctk.CTkLabel(frame, text="\u041a\u0430\u0440\u0442\u0430 \u0430\u0432\u0430\u0440\u0438\u0439 \u043f\u043e \u0410\u0431\u0430\u043a\u0430\u043d\u0443", font=ctk.CTkFont(size=22, weight="bold")).pack(anchor="w",
+                                                                                                           pady=(0, 10))
+        top = ctk.CTkFrame(frame)
+        top.pack(fill="x", pady=(0, 8))
+        ctk.CTkButton(top, text="\u0426\u0435\u043d\u0442\u0440: \u0410\u0431\u0430\u043a\u0430\u043d", fg_color="#1f6aa5", command=self.center_map_to_abakan).pack(side="left", padx=6, pady=8)
+        ctk.CTkButton(top, text="\u0426\u0435\u043d\u0442\u0440: \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u044b\u0439 \u0434\u043e\u043c", fg_color="#31465d", command=self.center_map_to_selected_house).pack(side="left", padx=6, pady=8)
+        ctk.CTkButton(top, text="-", width=34, command=lambda: self.change_network_map_zoom(-1)).pack(side="left", padx=(12, 4), pady=8)
+        ctk.CTkButton(top, text="+", width=34, command=lambda: self.change_network_map_zoom(1)).pack(side="left", padx=4, pady=8)
+        self.network_zoom_label = ctk.CTkLabel(top, text="\u041c\u0430\u0441\u0448\u0442\u0430\u0431: 13", text_color="#9eb4ca")
+        self.network_zoom_label.pack(side="left", padx=(8, 0))
+        self.network_map_search_entry = ctk.CTkEntry(top, width=250, placeholder_text="Поиск адреса на карте")
+        self.network_map_search_entry.pack(side="left", padx=(12, 6), pady=8)
+        self.network_map_search_entry.bind("<Return>", lambda _e: self.focus_map_on_address())
+        self.network_map_search_btn = ctk.CTkButton(top, text="Найти адрес", width=110, fg_color="#345b7e", command=self.focus_map_on_address)
+        self.network_map_search_btn.pack(side="left", padx=(0, 6), pady=8)
+        ctk.CTkButton(top, text="\u041d\u043e\u0432\u0430\u044f \u0430\u0432\u0430\u0440\u0438\u044f \u043f\u043e \u0434\u043e\u043c\u0443", fg_color="#8b1a1a", command=self.create_network_incident).pack(side="left", padx=6, pady=8)
+        ctk.CTkButton(top, text="\u0417\u0430\u043a\u0440\u044b\u0442\u044c \u0430\u0432\u0430\u0440\u0438\u044e", fg_color="#1f6a3a", command=self.resolve_network_incident).pack(side="left", padx=6, pady=8)
+        ctk.CTkButton(top, text="\u041e\u0431\u043d\u043e\u0432\u0438\u0442\u044c", command=self.load_network_map_data).pack(side="left", padx=6, pady=8)
+
+        content = ctk.CTkFrame(frame)
+        content.pack(fill="both", expand=True)
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_columnconfigure(1, weight=1)
+        content.grid_rowconfigure(1, weight=1)
+
+        self.network_nodes_tree = ttk.Treeview(content, columns=("house_id", "address", "clients", "active", "status"), show="headings", height=9)
+        for col, title, width in [
+            ("house_id", "\u0414\u043e\u043c ID", 70),
+            ("address", "\u0410\u0434\u0440\u0435\u0441", 340),
+            ("clients", "\u041a\u043b\u0438\u0435\u043d\u0442\u043e\u0432", 90),
+            ("active", "\u0410\u0432\u0430\u0440\u0438\u0439", 80),
+            ("status", "\u0421\u043e\u0441\u0442\u043e\u044f\u043d\u0438\u0435", 100),
+        ]:
+            self.network_nodes_tree.heading(col, text=title)
+            self.network_nodes_tree.column(col, width=width)
+        self.network_nodes_tree.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 6))
+        self.network_nodes_tree.bind("<<TreeviewSelect>>", self.on_select_network_node)
+
+        self.network_incidents_tree = ttk.Treeview(content, columns=("id", "house", "title", "desc", "severity", "status", "clients", "started"), show="headings", height=9)
+        for col, title, width in [
+            ("id", "ID", 50),
+            ("house", "\u0414\u043e\u043c", 90),
+            ("title", "\u0410\u0432\u0430\u0440\u0438\u044f", 170),
+            ("desc", "\u041e\u043f\u0438\u0441\u0430\u043d\u0438\u0435", 220),
+            ("severity", "\u041a\u0440\u0438\u0442\u0438\u0447.", 90),
+            ("status", "\u0421\u0442\u0430\u0442\u0443\u0441", 90),
+            ("clients", "\u041a\u043b\u0438\u0435\u043d\u0442\u043e\u0432", 90),
+            ("started", "\u041d\u0430\u0447\u0430\u043b\u043e", 130),
+        ]:
+            self.network_incidents_tree.heading(col, text=title)
+            self.network_incidents_tree.column(col, width=width)
+        self.network_incidents_tree.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
+
+        self.network_canvas = ctk.CTkCanvas(content, bg="#10151d", highlightthickness=0, height=330)
+        self.network_canvas.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(6, 0))
+        self.network_canvas.bind("<Configure>", self.on_network_canvas_resize)
+        self.network_canvas.bind("<Enter>", self.on_network_canvas_enter)
+        self.network_canvas.bind("<MouseWheel>", self.on_network_canvas_mousewheel)
+        self.network_canvas.bind("<Button-4>", self.on_network_canvas_mousewheel)
+        self.network_canvas.bind("<Button-5>", self.on_network_canvas_mousewheel)
+        self.network_canvas.bind("<ButtonPress-1>", self.on_network_canvas_drag_start)
+        self.network_canvas.bind("<B1-Motion>", self.on_network_canvas_drag_move)
+        self.network_canvas.bind("<ButtonRelease-1>", self.on_network_canvas_drag_end)
+
+        right_bottom = ctk.CTkFrame(content)
+        right_bottom.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(6, 0))
+        right_bottom.grid_rowconfigure(1, weight=1)
+        right_bottom.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(right_bottom, text="\u0417\u043e\u043d\u0430 \u0432\u043b\u0438\u044f\u043d\u0438\u044f (\u043a\u043b\u0438\u0435\u043d\u0442\u044b \u0434\u043e\u043c\u0430)", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(8, 4))
+        self.network_affected_tree = ttk.Treeview(right_bottom, columns=("id", "name", "phone"), show="headings")
+        self.network_affected_tree.heading("id", text="CID")
+        self.network_affected_tree.heading("name", text="\u041a\u043b\u0438\u0435\u043d\u0442")
+        self.network_affected_tree.heading("phone", text="\u0422\u0435\u043b\u0435\u0444\u043e\u043d")
+        self.network_affected_tree.column("id", width=60)
+        self.network_affected_tree.column("name", width=220)
+        self.network_affected_tree.column("phone", width=140)
+        self.network_affected_tree.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 8))
+
+    def load_network_map_data(self):
+        if not self.conn:
+            return
+        cursor = self.conn.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT h.house_id, h.full_address, h.latitude, h.longitude,
+                   COUNT(c.customer_id) AS clients_count,
+                   SUM(CASE WHEN i.status='Активна' THEN 1 ELSE 0 END) AS active_incidents
+            FROM city_houses h
+            LEFT JOIN customers c ON c.house_id = h.house_id
+            LEFT JOIN house_incidents i ON i.house_id = h.house_id
+            GROUP BY h.house_id, h.full_address, h.latitude, h.longitude
+            ORDER BY clients_count DESC, h.full_address
+        """)
+        self.network_nodes_rows = cursor.fetchall()
+        cursor.execute("""
+            SELECT i.incident_id, i.house_id, i.title, i.description, i.severity, i.status, i.started_at,
+                   (SELECT COUNT(*) FROM customers c WHERE c.house_id=i.house_id) AS affected_clients
+            FROM house_incidents i
+            ORDER BY i.started_at DESC
+        """)
+        self.network_incidents_rows = cursor.fetchall()
+        cursor.close()
+        self.render_network_nodes()
+        self.render_network_incidents()
+        self.draw_network_canvas()
+        self.load_affected_customers()
+
+    def render_network_nodes(self):
+        for item in self.network_nodes_tree.get_children():
+            self.network_nodes_tree.delete(item)
+        for row in self.network_nodes_rows:
+            active = int(row.get("active_incidents") or 0)
+            status = "АВАРИЯ" if active > 0 else "OK"
+            self.network_nodes_tree.insert("", "end", iid=str(row["house_id"]),
+                                           values=(row["house_id"], row["full_address"][:90], row.get("clients_count") or 0, active, status))
+
+    def render_network_incidents(self):
+        for item in self.network_incidents_tree.get_children():
+            self.network_incidents_tree.delete(item)
+        for row in self.network_incidents_rows:
+            started = row["started_at"].strftime("%d.%m %H:%M") if isinstance(row["started_at"], datetime) else str(row["started_at"])
+            self.network_incidents_tree.insert("", "end", iid=str(row["incident_id"]),
+                                               values=(row["incident_id"], row["house_id"], row["title"][:80], (row.get("description") or "")[:100], row["severity"],
+                                                       row["status"], row.get("affected_clients") or 0, started))
+
+    def on_select_network_node(self, _event=None):
+        self.load_affected_customers()
+
+    def on_network_canvas_enter(self, _event=None):
+        try:
+            self.network_canvas.focus_set()
+        except Exception:
+            pass
+
+    def on_network_canvas_resize(self, _event=None):
+        if getattr(self, "network_map_resize_job", None):
+            try:
+                self.after_cancel(self.network_map_resize_job)
+            except Exception:
+                pass
+        self.network_map_resize_job = self.after(180, self.draw_network_canvas)
+
+    def schedule_network_map_draw(self, delay=40):
+        if getattr(self, "network_map_draw_job", None):
+            try:
+                self.after_cancel(self.network_map_draw_job)
+            except Exception:
+                pass
+        self.network_map_draw_job = self.after(delay, self.draw_network_canvas)
+
+    def on_network_canvas_mousewheel(self, event):
+        delta = 0
+        if hasattr(event, "delta") and event.delta:
+            delta = 1 if event.delta > 0 else -1
+        elif getattr(event, "num", None) == 4:
+            delta = 1
+        elif getattr(event, "num", None) == 5:
+            delta = -1
+        if delta:
+            self.change_network_map_zoom(delta)
+        return "break"
+
+    def on_network_canvas_drag_start(self, event):
+        self.network_map_drag_last = (event.x, event.y)
+        self.network_map_drag_accum_dx = 0
+        self.network_map_drag_accum_dy = 0
+
+    def on_network_canvas_drag_move(self, event):
+        if not self.network_map_drag_last:
+            self.network_map_drag_last = (event.x, event.y)
+            return
+        last_x, last_y = self.network_map_drag_last
+        dx = event.x - last_x
+        dy = event.y - last_y
+        self.network_map_drag_last = (event.x, event.y)
+        if dx == 0 and dy == 0:
+            return
+        self.network_canvas.move("all", dx, dy)
+        self.network_map_drag_accum_dx += dx
+        self.network_map_drag_accum_dy += dy
+
+    def on_network_canvas_drag_end(self, _event=None):
+        rows = [r for r in getattr(self, "network_nodes_rows", []) if r.get("latitude") and r.get("longitude")]
+        if rows and (self.network_map_drag_accum_dx or self.network_map_drag_accum_dy):
+            center_lat, center_lon = self._get_network_map_center(rows)
+            self.network_map_center = self._shift_center_by_pixels(
+                center_lat,
+                center_lon,
+                -self.network_map_drag_accum_dx,
+                -self.network_map_drag_accum_dy,
+                self.network_map_zoom,
+            )
+        self.network_map_drag_last = None
+        self.network_map_drag_accum_dx = 0
+        self.network_map_drag_accum_dy = 0
+        self.schedule_network_map_draw(20)
+
+    def change_network_map_zoom(self, delta):
+        self.network_map_zoom = max(11, min(17, int(self.network_map_zoom) + delta))
+        if hasattr(self, "network_zoom_label"):
+            self.network_zoom_label.configure(text=f"\u041c\u0430\u0441\u0448\u0442\u0430\u0431: {self.network_map_zoom}")
+        self.schedule_network_map_draw(80)
+
+    def focus_map_on_address(self):
+        query = self.network_map_search_entry.get().strip() if hasattr(self, "network_map_search_entry") else ""
+        if not query:
+            messagebox.showinfo("Карта", "Введите адрес для поиска.")
+            return
+        self.network_map_search_btn.configure(state="disabled", text="Поиск...")
+
+        def worker():
+            err = None
+            rows = []
+            try:
+                rows = self.geocode_search(query, limit=1)
+            except Exception as ex:
+                err = str(ex)
+
+            def on_done():
+                self.network_map_search_btn.configure(state="normal", text="Найти адрес")
+                if err:
+                    messagebox.showerror("Карта", f"Не удалось найти адрес:\n{err}")
+                    return
+                if not rows:
+                    messagebox.showinfo("Карта", "Адрес не найден.")
+                    return
+                row = rows[0]
+                lat = float(row.get("lat", 0) or 0)
+                lon = float(row.get("lon", 0) or 0)
+                if not lat or not lon:
+                    messagebox.showwarning("Карта", "У найденного адреса нет координат.")
+                    return
+                self.network_map_center = (lat, lon)
+                self.network_map_zoom = max(self.network_map_zoom, 15)
+                if hasattr(self, "network_zoom_label"):
+                    self.network_zoom_label.configure(text=f"Масштаб: {self.network_map_zoom}")
+                self.schedule_network_map_draw(20)
+
+            self.after(0, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def center_map_to_abakan(self):
+        self.network_map_center = (53.7209, 91.4424)
+        self.schedule_network_map_draw(20)
+
+    def center_map_to_selected_house(self):
+        sel = self.network_nodes_tree.selection() if hasattr(self, "network_nodes_tree") else []
+        if not sel:
+            messagebox.showinfo("\u041a\u0430\u0440\u0442\u0430", "\u0421\u043d\u0430\u0447\u0430\u043b\u0430 \u0432\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u0434\u043e\u043c \u0432 \u043b\u0435\u0432\u043e\u043c \u0441\u043f\u0438\u0441\u043a\u0435.")
+            return
+        house_id = int(sel[0])
+        row = next((r for r in self.network_nodes_rows if int(r["house_id"]) == house_id), None)
+        if not row or not row.get("latitude") or not row.get("longitude"):
+            messagebox.showwarning("\u041a\u0430\u0440\u0442\u0430", "\u0414\u043b\u044f \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u043e\u0433\u043e \u0434\u043e\u043c\u0430 \u043d\u0435\u0442 \u043a\u043e\u043e\u0440\u0434\u0438\u043d\u0430\u0442.")
+            return
+        self.network_map_center = (float(row["latitude"]), float(row["longitude"]))
+        self.schedule_network_map_draw(20)
+
+    def _get_network_map_center(self, rows):
+        if self.network_map_center:
+            return self.network_map_center
+        return (
+            sum(float(r["latitude"]) for r in rows) / len(rows),
+            sum(float(r["longitude"]) for r in rows) / len(rows),
+        )
+
+    def _latlon_to_world(self, lat_value, lon_value, zoom):
+        sin_lat = max(min(math.sin(math.radians(lat_value)), 0.9999), -0.9999)
+        world = 256 * (2 ** zoom)
+        x = (lon_value + 180.0) / 360.0 * world
+        y = (0.5 - math.log((1 + sin_lat) / (1 - sin_lat)) / (4 * math.pi)) * world
+        return x, y
+
+    def _world_to_latlon(self, x_value, y_value, zoom):
+        world = 256 * (2 ** zoom)
+        lon = (x_value / world) * 360.0 - 180.0
+        n = math.pi - (2.0 * math.pi * y_value) / world
+        lat = math.degrees(math.atan(math.sinh(n)))
+        return lat, lon
+
+    def _shift_center_by_pixels(self, center_lat, center_lon, dx, dy, zoom):
+        cx, cy = self._latlon_to_world(center_lat, center_lon, zoom)
+        return self._world_to_latlon(cx + dx, cy + dy, zoom)
+
+    def _project_to_static_map(self, lat, lon, center_lat, center_lon, zoom, width, height):
+        cx, cy = self._latlon_to_world(center_lat, center_lon, zoom)
+        px, py = self._latlon_to_world(lat, lon, zoom)
+        return (px - cx) + (width / 2), (py - cy) + (height / 2)
+
+    def _fetch_yandex_static_map(self, center_lat, center_lon, zoom, width, height):
+        width = max(200, min(int(width), 650))
+        height = max(180, min(int(height), 450))
+        params = {
+            "ll": f"{center_lon:.6f},{center_lat:.6f}",
+            "z": str(int(zoom)),
+            "size": f"{width},{height}",
+            "l": "map",
+            "lang": "ru_RU",
+            "scale": "1",
+        }
+        ykey = os.getenv("YANDEX_MAPS_API_KEY", "62d9f365-7a46-4faa-a631-8f50f06091e6").strip()
+        if ykey:
+            params["apikey"] = ykey
+
+        cache_key = (params["ll"], params["z"], params["size"])
+        self.network_map_current_key = cache_key
+        if cache_key in self.network_map_image_cache:
+            self.network_map_photo = self.network_map_image_cache[cache_key]
+            self.network_map_last_params = cache_key
+            return width, height, True
+
+        if cache_key not in self.network_map_loading_keys:
+            self.network_map_loading_keys.add(cache_key)
+
+            def worker():
+                content = None
+                try:
+                    response = requests.get("https://static-maps.yandex.ru/v1", params=params, timeout=6)
+                    response.raise_for_status()
+                    content = response.content
+                except Exception:
+                    try:
+                        fallback_params = {
+                            "ll": params["ll"],
+                            "z": params["z"],
+                            "size": params["size"],
+                            "l": "map",
+                            "lang": "ru_RU",
+                        }
+                        response = requests.get("https://static-maps.yandex.ru/1.x/", params=fallback_params, timeout=6)
+                        response.raise_for_status()
+                        content = response.content
+                    except Exception:
+                        content = None
+
+                def on_done():
+                    self.network_map_loading_keys.discard(cache_key)
+                    if content:
+                        image = Image.open(io.BytesIO(content)).convert("RGB")
+                        photo = ImageTk.PhotoImage(image=image)
+                        self.network_map_image_cache[cache_key] = photo
+                        if len(self.network_map_image_cache) > 50:
+                            for old_key in list(self.network_map_image_cache.keys())[:-30]:
+                                self.network_map_image_cache.pop(old_key, None)
+                    if self.network_map_current_key == cache_key:
+                        self.draw_network_canvas()
+
+                self.after(0, on_done)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        return width, height, False
+
+    def draw_network_canvas(self):
+        self.network_canvas.delete("all")
+        rows = [r for r in getattr(self, "network_nodes_rows", []) if r.get("latitude") and r.get("longitude")]
+        if not rows:
+            self.network_canvas.create_text(
+                250,
+                170,
+                text="\u041d\u0435\u0442 \u043a\u043e\u043e\u0440\u0434\u0438\u043d\u0430\u0442 \u0434\u043e\u043c\u043e\u0432. \u0418\u0441\u043f\u043e\u043b\u044c\u0437\u0443\u0439\u0442\u0435 API \u0430\u0434\u0440\u0435\u0441\u043e\u0432 \u043f\u0440\u0438 \u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0430\u0446\u0438\u0438.",
+                fill="#8899aa",
+                font=("Segoe UI", 12),
+            )
+            return
+
+        canvas_width = max(200, self.network_canvas.winfo_width() - 2)
+        canvas_height = max(180, self.network_canvas.winfo_height() - 2)
+        center_lat, center_lon = self._get_network_map_center(rows)
+        map_loaded = False
+        try:
+            map_w, map_h, map_loaded = self._fetch_yandex_static_map(center_lat, center_lon, self.network_map_zoom, canvas_width, canvas_height)
+            x0 = (canvas_width - map_w) // 2
+            y0 = (canvas_height - map_h) // 2
+            if map_loaded and self.network_map_photo is not None:
+                self.network_canvas.create_image(x0, y0, anchor="nw", image=self.network_map_photo)
+            else:
+                self.network_canvas.create_rectangle(x0, y0, x0 + map_w, y0 + map_h, fill="#121722", outline="")
+                self.network_canvas.create_text(
+                    x0 + 16,
+                    y0 + 14,
+                    anchor="nw",
+                    fill="#9eb4ca",
+                    text="Загрузка карты...",
+                    font=("Segoe UI", 11, "bold"),
+                )
+        except Exception:
+            map_w, map_h = canvas_width, canvas_height
+            x0, y0 = 0, 0
+            self.network_canvas.create_rectangle(0, 0, canvas_width, canvas_height, fill="#121722", outline="")
+            self.network_canvas.create_text(
+                16,
+                12,
+                anchor="nw",
+                fill="#f19999",
+                text="\u041a\u0430\u0440\u0442\u0430 \u0432\u0440\u0435\u043c\u0435\u043d\u043d\u043e \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430, \u043f\u043e\u043a\u0430\u0437\u0430\u043d\u044b \u0442\u043e\u043b\u044c\u043a\u043e \u0441\u0442\u0430\u0442\u0443\u0441\u044b \u0434\u043e\u043c\u043e\u0432",
+                font=("Segoe UI", 10, "bold"),
+            )
+
+        self.network_canvas.create_rectangle(x0 + 10, y0 + 10, x0 + 360, y0 + 36, fill="#10151d", outline="")
+        self.network_canvas.create_text(
+            x0 + 18,
+            y0 + 23,
+            anchor="w",
+            fill="#dce6f2",
+            text="\u0417\u0435\u043b\u0435\u043d\u044b\u0439: \u0441\u0442\u0430\u0431\u0438\u043b\u044c\u043d\u043e | \u041a\u0440\u0430\u0441\u043d\u044b\u0439: \u0430\u0432\u0430\u0440\u0438\u044f | \u0427\u0438\u0441\u043b\u043e: \u043a\u043b\u0438\u0435\u043d\u0442\u043e\u0432",
+            font=("Segoe UI", 10),
+        )
+
+        for r in rows:
+            lat = float(r["latitude"])
+            lon = float(r["longitude"])
+            px, py = self._project_to_static_map(lat, lon, center_lat, center_lon, self.network_map_zoom, map_w, map_h)
+            px += x0
+            py += y0
+            if px < x0 - 30 or py < y0 - 30 or px > x0 + map_w + 30 or py > y0 + map_h + 30:
+                continue
+            clients = int(r.get("clients_count") or 0)
+            active = int(r.get("active_incidents") or 0)
+            color = "#d34a4a" if active > 0 else "#32b06a"
+            radius = 11 + min(clients, 40) * 0.35
+            self.network_canvas.create_oval(px - radius, py - radius, px + radius, py + radius, fill=color, outline="#ecf1f7", width=1)
+            self.network_canvas.create_text(px, py, text=str(clients), fill="white", font=("Segoe UI", 9, "bold"))
+
+    def load_affected_customers(self):
+        for item in self.network_affected_tree.get_children():
+            self.network_affected_tree.delete(item)
+        sel = self.network_nodes_tree.selection()
+        if not sel:
+            return
+        house_id = int(sel[0])
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT customer_id, name, phone FROM customers WHERE house_id=%s ORDER BY name", (house_id,))
+        for row in cursor.fetchall():
+            self.network_affected_tree.insert("", "end", values=row)
+        cursor.close()
+
+    def create_network_incident(self):
+        sel = self.network_nodes_tree.selection()
+        if not sel:
+            messagebox.showinfo("Авария", "Сначала выберите дом в левом списке.")
+            return
+        house_id = int(sel[0])
+        modal = self.open_modal("Новая авария по дому", "560x430")
+        result = {"ok": False, "title": "", "severity": "Средняя", "desc": ""}
+        body = ctk.CTkFrame(modal)
+        body.pack(fill="both", expand=True, padx=16, pady=(16, 8))
+        body.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(body, text=f"Дом ID: {house_id}").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        ctk.CTkLabel(body, text="Название аварии").grid(row=1, column=0, sticky="w")
+        title_entry = ctk.CTkEntry(body, height=34)
+        title_entry.insert(0, "Нет связи в доме")
+        title_entry.grid(row=2, column=0, sticky="ew", pady=(4, 8))
+        ctk.CTkLabel(body, text="Критичность").grid(row=3, column=0, sticky="w")
+        severity_combo = ctk.CTkComboBox(body, values=["Низкая", "Средняя", "Высокая", "Критическая"], height=34)
+        severity_combo.set("Средняя")
+        severity_combo.grid(row=4, column=0, sticky="ew", pady=(4, 8))
+        ctk.CTkLabel(body, text="Описание").grid(row=5, column=0, sticky="w")
+        desc_entry = ctk.CTkTextbox(body, height=120)
+        desc_entry.grid(row=6, column=0, sticky="nsew", pady=(4, 8))
+        body.grid_rowconfigure(6, weight=1)
+        actions = ctk.CTkFrame(modal, fg_color="transparent")
+        actions.pack(fill="x", padx=16, pady=(0, 14))
+        def submit():
+            result["title"] = title_entry.get().strip()
+            result["severity"] = severity_combo.get().strip() or "Средняя"
+            result["desc"] = desc_entry.get("0.0", "end").strip()
+            result["ok"] = bool(result["title"])
+            modal.destroy()
+        ctk.CTkButton(actions, text="Создать аварию", fg_color="#8b1a1a", command=submit).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="Отмена", command=modal.destroy).pack(side="left")
+        modal.wait_window()
+        if not result["ok"]:
+            return
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "INSERT INTO house_incidents (house_id, title, severity, status, description, started_at) VALUES (%s, %s, %s, %s, %s, %s)",
+            (house_id, result["title"], result["severity"], "Активна", result["desc"] or "", datetime.now()))
+        self.conn.commit()
+        cursor.close()
+        self.log_house_affected_customers(house_id, f"Авария дома: {result['title']}")
+        self.load_network_map_data()
+
+    def resolve_network_incident(self):
+        sel = self.network_incidents_tree.selection()
+        if not sel:
+            messagebox.showinfo("Авария", "Выберите инцидент в списке справа.")
+            return
+        incident_id = int(sel[0])
+        comment = self.prompt_single_line("Закрытие аварии", "Комментарий при закрытии:", "Связь восстановлена")
+        if comment is None:
+            return
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT house_id, title FROM house_incidents WHERE incident_id=%s", (incident_id,))
+        row = cursor.fetchone()
+        if not row:
+            cursor.close()
+            return
+        house_id, title = row[0], row[1]
+        cursor.execute(
+            "UPDATE house_incidents SET status='Закрыта', resolved_at=%s, description=CONCAT(IFNULL(description,''), %s) WHERE incident_id=%s",
+            (datetime.now(), f"\n[Закрытие] {comment}", incident_id))
+        self.conn.commit()
+        cursor.close()
+        self.log_house_affected_customers(house_id, f"Авария закрыта: {title}")
+        self.load_network_map_data()
+
+    def log_house_affected_customers(self, house_id, details):
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT customer_id FROM customers WHERE house_id=%s", (house_id,))
+        customer_ids = [r[0] for r in cursor.fetchall()]
+        cursor.close()
+        for cid in customer_ids:
+            self.log_customer_event(cid, "Диагностика", details)
+
+    def open_abakan_map(self):
+        # Backward compatibility for old button/action names.
+        self.draw_network_canvas()
+
 
     def log_customer_event(self, customer_id, event_type, details, actor=None):
         if not self.conn or not customer_id:

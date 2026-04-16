@@ -10,8 +10,12 @@ CREATE TABLE IF NOT EXISTS customers (
     phone VARCHAR(50) NOT NULL,
     email VARCHAR(255) NOT NULL,
     plan_id INT,
+    house_id INT NULL,
+    latitude DECIMAL(10, 7) NULL,
+    longitude DECIMAL(10, 7) NULL,
     registration_date DATETIME,
-    INDEX (plan_id)
+    INDEX (plan_id),
+    INDEX (house_id)
 );
 
 -- Plans table
@@ -153,4 +157,33 @@ CREATE TABLE IF NOT EXISTS network_incidents (
     FOREIGN KEY (node_id) REFERENCES network_nodes(node_id),
     INDEX (node_id, status),
     INDEX (started_at)
+);
+
+-- Houses geodirectory for Abakan map
+CREATE TABLE IF NOT EXISTS city_houses (
+    house_id INT AUTO_INCREMENT PRIMARY KEY,
+    city VARCHAR(80) NOT NULL DEFAULT 'Абакан',
+    street VARCHAR(255),
+    house_number VARCHAR(60),
+    full_address VARCHAR(255) NOT NULL,
+    latitude DECIMAL(10, 7),
+    longitude DECIMAL(10, 7),
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE KEY uq_city_houses_full_address (full_address),
+    INDEX idx_city_houses_latlon (latitude, longitude)
+);
+
+-- House outages (red/green house circles)
+CREATE TABLE IF NOT EXISTS house_incidents (
+    incident_id INT AUTO_INCREMENT PRIMARY KEY,
+    house_id INT NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    severity VARCHAR(20) NOT NULL DEFAULT 'Средняя',
+    status VARCHAR(20) NOT NULL DEFAULT 'Активна',
+    description TEXT,
+    started_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    resolved_at DATETIME,
+    FOREIGN KEY (house_id) REFERENCES city_houses(house_id),
+    INDEX idx_house_incidents_status (house_id, status),
+    INDEX idx_house_incidents_started (started_at)
 );
