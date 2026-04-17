@@ -1,2 +1,3 @@
 customtkinter
 mysql-connector-python
+pywebview

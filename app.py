@@ -10,9 +10,15 @@ import time
 import re
 import json
 import os
+import sys
+import tempfile
 import io
 import math
 from PIL import Image, ImageTk
+try:
+    import webview
+except Exception:
+    webview = None
 
 # Настройки темы
 ctk.set_appearance_mode("System")
@@ -33,6 +39,10 @@ class ISPAutomationSystem(ctk.CTk):
         self.selected_house_id = None
         self.selected_lat = None
         self.selected_lon = None
+        self.map_webview_process = None
+        self.map_webview_payload_path = os.path.join(tempfile.gettempdir(), "skat_network_map_payload.json")
+        self.map_webview_payload_hash = ""
+        self.map_webview_refresh_job = None
         if self.conn:
             self.ensure_geo_schema()
 
@@ -129,6 +139,7 @@ class ISPAutomationSystem(ctk.CTk):
     def on_close(self):
         self.stop_chat_polling()
         self.stop_customer_360_polling()
+        self._stop_webview_map_process()
         self.destroy()
 
     def open_modal(self, title, geometry="460x240"):
@@ -1594,7 +1605,13 @@ class ISPAutomationSystem(ctk.CTk):
         cursor.close()
         self.render_network_nodes()
         self.render_network_incidents()
-        self.draw_network_canvas()
+        if self.network_canvas is not None:
+            self.schedule_network_map_draw(30)
+        elif hasattr(self, "network_map_hint"):
+            houses = len(self.network_nodes_rows)
+            incidents = sum(int(r.get("active_incidents") or 0) for r in self.network_nodes_rows)
+            self.network_map_hint.configure(text=f"Домов на карте: {houses}. Активных аварий: {incidents}.")
+        self.sync_webview_map_window()
         self.load_affected_customers()
 
     def render_network_nodes(self):
@@ -1839,8 +1856,10 @@ class ISPAutomationSystem(ctk.CTk):
         self.network_map_drag_accum_dx = 0
         self.network_map_drag_accum_dy = 0
         self.network_map_image_cache = {}
-        self.network_map_loading_keys = set()
+        self.network_map_loading = False
+        self.network_map_pending_request = None
         self.network_map_current_key = None
+        self.network_map_last_render_key = None
 
         ctk.CTkLabel(frame, text="\u041a\u0430\u0440\u0442\u0430 \u0430\u0432\u0430\u0440\u0438\u0439 \u043f\u043e \u0410\u0431\u0430\u043a\u0430\u043d\u0443", font=ctk.CTkFont(size=22, weight="bold")).pack(anchor="w",
                                                                                                            pady=(0, 10))
@@ -1895,16 +1914,22 @@ class ISPAutomationSystem(ctk.CTk):
             self.network_incidents_tree.column(col, width=width)
         self.network_incidents_tree.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
 
-        self.network_canvas = ctk.CTkCanvas(content, bg="#10151d", highlightthickness=0, height=330)
-        self.network_canvas.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(6, 0))
-        self.network_canvas.bind("<Configure>", self.on_network_canvas_resize)
-        self.network_canvas.bind("<Enter>", self.on_network_canvas_enter)
-        self.network_canvas.bind("<MouseWheel>", self.on_network_canvas_mousewheel)
-        self.network_canvas.bind("<Button-4>", self.on_network_canvas_mousewheel)
-        self.network_canvas.bind("<Button-5>", self.on_network_canvas_mousewheel)
-        self.network_canvas.bind("<ButtonPress-1>", self.on_network_canvas_drag_start)
-        self.network_canvas.bind("<B1-Motion>", self.on_network_canvas_drag_move)
-        self.network_canvas.bind("<ButtonRelease-1>", self.on_network_canvas_drag_end)
+        self.network_map_host = ctk.CTkFrame(content, fg_color="#10151d", corner_radius=8)
+        self.network_map_host.grid(row=1, column=0, sticky="nsew", padx=(0, 6), pady=(6, 0))
+        self.network_map_host.grid_columnconfigure(0, weight=1)
+        self.network_map_host.grid_rowconfigure(1, weight=1)
+        ctk.CTkLabel(self.network_map_host, text="Интерактивная карта WebView", font=ctk.CTkFont(size=14, weight="bold")).grid(
+            row=0, column=0, sticky="w", padx=12, pady=(10, 6))
+        self.network_map_hint = ctk.CTkLabel(
+            self.network_map_host,
+            text="Карта открывается в отдельном окне: плавный drag/zoom и поиск адреса.",
+            text_color="#9eb4ca",
+        )
+        self.network_map_hint.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 8))
+        map_btns = ctk.CTkFrame(self.network_map_host, fg_color="transparent")
+        map_btns.grid(row=2, column=0, sticky="w", padx=12, pady=(0, 12))
+        ctk.CTkButton(map_btns, text="Открыть карту", fg_color="#1f6aa5", command=self.open_webview_map).pack(side="left", padx=(0, 8))
+        self.network_canvas = None
 
         right_bottom = ctk.CTkFrame(content)
         right_bottom.grid(row=1, column=1, sticky="nsew", padx=(6, 0), pady=(6, 0))
@@ -1971,6 +1996,8 @@ class ISPAutomationSystem(ctk.CTk):
         self.load_affected_customers()
 
     def on_network_canvas_enter(self, _event=None):
+        if self.network_canvas is None:
+            return
         try:
             self.network_canvas.focus_set()
         except Exception:
@@ -1982,7 +2009,7 @@ class ISPAutomationSystem(ctk.CTk):
                 self.after_cancel(self.network_map_resize_job)
             except Exception:
                 pass
-        self.network_map_resize_job = self.after(180, self.draw_network_canvas)
+        self.network_map_resize_job = self.after(240, self.draw_network_canvas)
 
     def schedule_network_map_draw(self, delay=40):
         if getattr(self, "network_map_draw_job", None):
@@ -1993,6 +2020,8 @@ class ISPAutomationSystem(ctk.CTk):
         self.network_map_draw_job = self.after(delay, self.draw_network_canvas)
 
     def on_network_canvas_mousewheel(self, event):
+        if self.network_canvas is None:
+            return "break"
         delta = 0
         if hasattr(event, "delta") and event.delta:
             delta = 1 if event.delta > 0 else -1
@@ -2005,11 +2034,15 @@ class ISPAutomationSystem(ctk.CTk):
         return "break"
 
     def on_network_canvas_drag_start(self, event):
+        if self.network_canvas is None:
+            return
         self.network_map_drag_last = (event.x, event.y)
         self.network_map_drag_accum_dx = 0
         self.network_map_drag_accum_dy = 0
 
     def on_network_canvas_drag_move(self, event):
+        if self.network_canvas is None:
+            return
         if not self.network_map_drag_last:
             self.network_map_drag_last = (event.x, event.y)
             return
@@ -2024,6 +2057,8 @@ class ISPAutomationSystem(ctk.CTk):
         self.network_map_drag_accum_dy += dy
 
     def on_network_canvas_drag_end(self, _event=None):
+        if self.network_canvas is None:
+            return
         rows = [r for r in getattr(self, "network_nodes_rows", []) if r.get("latitude") and r.get("longitude")]
         if rows and (self.network_map_drag_accum_dx or self.network_map_drag_accum_dy):
             center_lat, center_lon = self._get_network_map_center(rows)
@@ -2037,13 +2072,13 @@ class ISPAutomationSystem(ctk.CTk):
         self.network_map_drag_last = None
         self.network_map_drag_accum_dx = 0
         self.network_map_drag_accum_dy = 0
-        self.schedule_network_map_draw(20)
+        self.schedule_network_map_draw(180)
 
     def change_network_map_zoom(self, delta):
         self.network_map_zoom = max(11, min(17, int(self.network_map_zoom) + delta))
         if hasattr(self, "network_zoom_label"):
             self.network_zoom_label.configure(text=f"\u041c\u0430\u0441\u0448\u0442\u0430\u0431: {self.network_map_zoom}")
-        self.schedule_network_map_draw(80)
+        self.schedule_network_map_draw(160)
 
     def focus_map_on_address(self):
         query = self.network_map_search_entry.get().strip() if hasattr(self, "network_map_search_entry") else ""
@@ -2086,7 +2121,7 @@ class ISPAutomationSystem(ctk.CTk):
 
     def center_map_to_abakan(self):
         self.network_map_center = (53.7209, 91.4424)
-        self.schedule_network_map_draw(20)
+        self.schedule_network_map_draw(120)
 
     def center_map_to_selected_house(self):
         sel = self.network_nodes_tree.selection() if hasattr(self, "network_nodes_tree") else []
@@ -2099,7 +2134,7 @@ class ISPAutomationSystem(ctk.CTk):
             messagebox.showwarning("\u041a\u0430\u0440\u0442\u0430", "\u0414\u043b\u044f \u0432\u044b\u0431\u0440\u0430\u043d\u043d\u043e\u0433\u043e \u0434\u043e\u043c\u0430 \u043d\u0435\u0442 \u043a\u043e\u043e\u0440\u0434\u0438\u043d\u0430\u0442.")
             return
         self.network_map_center = (float(row["latitude"]), float(row["longitude"]))
-        self.schedule_network_map_draw(20)
+        self.schedule_network_map_draw(120)
 
     def _get_network_map_center(self, rows):
         if self.network_map_center:
@@ -2133,8 +2168,8 @@ class ISPAutomationSystem(ctk.CTk):
         return (px - cx) + (width / 2), (py - cy) + (height / 2)
 
     def _fetch_yandex_static_map(self, center_lat, center_lon, zoom, width, height):
-        width = max(200, min(int(width), 650))
-        height = max(180, min(int(height), 450))
+        width = max(200, min(int(width), 560))
+        height = max(180, min(int(height), 360))
         params = {
             "ll": f"{center_lon:.6f},{center_lat:.6f}",
             "z": str(int(zoom)),
@@ -2154,52 +2189,69 @@ class ISPAutomationSystem(ctk.CTk):
             self.network_map_last_params = cache_key
             return width, height, True
 
-        if cache_key not in self.network_map_loading_keys:
-            self.network_map_loading_keys.add(cache_key)
-
-            def worker():
-                content = None
-                try:
-                    response = requests.get("https://static-maps.yandex.ru/v1", params=params, timeout=6)
-                    response.raise_for_status()
-                    content = response.content
-                except Exception:
-                    try:
-                        fallback_params = {
-                            "ll": params["ll"],
-                            "z": params["z"],
-                            "size": params["size"],
-                            "l": "map",
-                            "lang": "ru_RU",
-                        }
-                        response = requests.get("https://static-maps.yandex.ru/1.x/", params=fallback_params, timeout=6)
-                        response.raise_for_status()
-                        content = response.content
-                    except Exception:
-                        content = None
-
-                def on_done():
-                    self.network_map_loading_keys.discard(cache_key)
-                    if content:
-                        image = Image.open(io.BytesIO(content)).convert("RGB")
-                        photo = ImageTk.PhotoImage(image=image)
-                        self.network_map_image_cache[cache_key] = photo
-                        if len(self.network_map_image_cache) > 50:
-                            for old_key in list(self.network_map_image_cache.keys())[:-30]:
-                                self.network_map_image_cache.pop(old_key, None)
-                    if self.network_map_current_key == cache_key:
-                        self.draw_network_canvas()
-
-                self.after(0, on_done)
-
-            threading.Thread(target=worker, daemon=True).start()
+        self.network_map_pending_request = (cache_key, params)
+        self._kick_network_map_loader()
 
         return width, height, False
 
+    def _kick_network_map_loader(self):
+        if self.network_map_loading or not self.network_map_pending_request:
+            return
+        cache_key, params = self.network_map_pending_request
+        self.network_map_pending_request = None
+        self.network_map_loading = True
+
+        def worker():
+            content = None
+            try:
+                response = requests.get("https://static-maps.yandex.ru/v1", params=params, timeout=4)
+                response.raise_for_status()
+                content = response.content
+            except Exception:
+                try:
+                    fallback_params = {
+                        "ll": params["ll"],
+                        "z": params["z"],
+                        "size": params["size"],
+                        "l": "map",
+                        "lang": "ru_RU",
+                    }
+                    response = requests.get("https://static-maps.yandex.ru/1.x/", params=fallback_params, timeout=4)
+                    response.raise_for_status()
+                    content = response.content
+                except Exception:
+                    content = None
+
+            def on_done():
+                self.network_map_loading = False
+                if content:
+                    try:
+                        image = Image.open(io.BytesIO(content)).convert("RGB")
+                        photo = ImageTk.PhotoImage(image=image)
+                        self.network_map_image_cache[cache_key] = photo
+                        if len(self.network_map_image_cache) > 40:
+                            for old_key in list(self.network_map_image_cache.keys())[:-24]:
+                                self.network_map_image_cache.pop(old_key, None)
+                    except Exception:
+                        pass
+
+                if self.network_map_pending_request:
+                    self._kick_network_map_loader()
+
+                if self.network_map_current_key == cache_key:
+                    self.draw_network_canvas()
+
+            self.after(0, on_done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def draw_network_canvas(self):
-        self.network_canvas.delete("all")
+        if self.network_canvas is None:
+            return
         rows = [r for r in getattr(self, "network_nodes_rows", []) if r.get("latitude") and r.get("longitude")]
         if not rows:
+            self.network_map_last_render_key = None
+            self.network_canvas.delete("all")
             self.network_canvas.create_text(
                 250,
                 170,
@@ -2215,6 +2267,12 @@ class ISPAutomationSystem(ctk.CTk):
         map_loaded = False
         try:
             map_w, map_h, map_loaded = self._fetch_yandex_static_map(center_lat, center_lon, self.network_map_zoom, canvas_width, canvas_height)
+            render_key = (round(center_lat, 6), round(center_lon, 6), int(self.network_map_zoom), map_w, map_h, map_loaded,
+                          tuple((int(r["house_id"]), int(r.get("clients_count") or 0), int(r.get("active_incidents") or 0)) for r in rows))
+            if self.network_map_last_render_key == render_key:
+                return
+            self.network_map_last_render_key = render_key
+            self.network_canvas.delete("all")
             x0 = (canvas_width - map_w) // 2
             y0 = (canvas_height - map_h) // 2
             if map_loaded and self.network_map_photo is not None:
@@ -2230,6 +2288,8 @@ class ISPAutomationSystem(ctk.CTk):
                     font=("Segoe UI", 11, "bold"),
                 )
         except Exception:
+            self.network_map_last_render_key = None
+            self.network_canvas.delete("all")
             map_w, map_h = canvas_width, canvas_height
             x0, y0 = 0, 0
             self.network_canvas.create_rectangle(0, 0, canvas_width, canvas_height, fill="#121722", outline="")
@@ -2358,9 +2418,119 @@ class ISPAutomationSystem(ctk.CTk):
         for cid in customer_ids:
             self.log_customer_event(cid, "Диагностика", details)
 
+    def _build_network_map_payload(self):
+        houses = []
+        rows = [r for r in getattr(self, "network_nodes_rows", []) if r.get("latitude") and r.get("longitude")]
+        for r in rows:
+            houses.append({
+                "house_id": int(r["house_id"]),
+                "address": (r.get("full_address") or "").strip(),
+                "lat": float(r["latitude"]),
+                "lon": float(r["longitude"]),
+                "clients": int(r.get("clients_count") or 0),
+                "active": int(r.get("active_incidents") or 0),
+            })
+        if houses:
+            center_lat = sum(h["lat"] for h in houses) / len(houses)
+            center_lon = sum(h["lon"] for h in houses) / len(houses)
+        else:
+            center_lat, center_lon = 53.7209, 91.4424
+        return {
+            "center": {"lat": center_lat, "lon": center_lon},
+            "zoom": int(self.network_map_zoom if hasattr(self, "network_map_zoom") else 13),
+            "houses": houses,
+        }
+
+    def _write_webview_payload(self, payload):
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        changed = payload_json != self.map_webview_payload_hash
+        if changed:
+            with open(self.map_webview_payload_path, "w", encoding="utf-8") as f:
+                f.write(payload_json)
+            self.map_webview_payload_hash = payload_json
+        return changed
+
+    def _stop_webview_map_process(self):
+        if self.map_webview_refresh_job:
+            try:
+                self.after_cancel(self.map_webview_refresh_job)
+            except Exception:
+                pass
+            self.map_webview_refresh_job = None
+        proc = getattr(self, "map_webview_process", None)
+        if not proc:
+            return
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+        self.map_webview_process = None
+
+    def _restart_webview_map_silent(self):
+        self.map_webview_refresh_job = None
+        if not (self.map_webview_process and self.map_webview_process.poll() is None):
+            return
+        self.open_webview_map(force_restart=True, silent=True)
+
+    def sync_webview_map_window(self):
+        if not (self.map_webview_process and self.map_webview_process.poll() is None):
+            return
+        payload = self._build_network_map_payload()
+        if not payload["houses"]:
+            return
+        try:
+            changed = self._write_webview_payload(payload)
+        except Exception:
+            return
+        if not changed:
+            return
+        if self.map_webview_refresh_job:
+            try:
+                self.after_cancel(self.map_webview_refresh_job)
+            except Exception:
+                pass
+        # debounce: merge frequent updates into one restart
+        self.map_webview_refresh_job = self.after(350, self._restart_webview_map_silent)
+
+    def open_webview_map(self, force_restart=False, silent=False):
+        payload = self._build_network_map_payload()
+        if not payload["houses"]:
+            if not silent:
+                messagebox.showinfo("Карта", "Нет домов с координатами для отображения.")
+            return
+        try:
+            self._write_webview_payload(payload)
+        except Exception as ex:
+            if not silent:
+                messagebox.showerror("Карта", f"Не удалось сохранить данные карты:\n{ex}")
+            return
+
+        if force_restart:
+            self._stop_webview_map_process()
+
+        if self.map_webview_process and self.map_webview_process.poll() is None:
+            if not silent:
+                messagebox.showinfo("Карта", "Окно карты уже открыто.")
+            return
+
+        launcher = os.path.join(os.path.dirname(os.path.abspath(__file__)), "map_webview.py")
+        if not os.path.exists(launcher):
+            if not silent:
+                messagebox.showerror("Карта", f"Не найден модуль WebView:\n{launcher}")
+            return
+        try:
+            self.map_webview_process = subprocess.Popen([sys.executable, launcher, self.map_webview_payload_path])
+            if hasattr(self, "network_map_hint"):
+                self.network_map_hint.configure(text="Карта открыта. Обновление выполняется автоматически.")
+        except Exception as ex:
+            self.map_webview_process = None
+            if not silent:
+                messagebox.showerror("Карта", f"Не удалось открыть WebView карту:\n{ex}")
+
     def open_abakan_map(self):
         # Backward compatibility for old button/action names.
-        self.draw_network_canvas()
+        self.open_webview_map()
 
 
     def log_customer_event(self, customer_id, event_type, details, actor=None):
