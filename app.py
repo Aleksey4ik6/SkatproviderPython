@@ -113,6 +113,7 @@ class ISPAutomationSystem(ctk.CTk):
         self.customer_360_poll_job = None
         self.active_chat_customer_id = None
         self.chat_cache = []
+        self.chat_selection_sync = False
         self.customers_rows = []
         self.complaints_rows = []
         self.bills_rows = []
@@ -1104,6 +1105,8 @@ class ISPAutomationSystem(ctk.CTk):
         self.apply_chat_customer_filter()
 
     def on_select_chat_customer(self, event):
+        if self.chat_selection_sync:
+            return
         selection = self.chat_tree.selection()
         if not selection:
             return
@@ -1185,7 +1188,11 @@ class ISPAutomationSystem(ctk.CTk):
             if self.active_chat_customer_id and str(self.active_chat_customer_id) == iid:
                 selected_iid = iid
         if selected_iid:
-            self.chat_tree.selection_set(selected_iid)
+            self.chat_selection_sync = True
+            try:
+                self.chat_tree.selection_set(selected_iid)
+            finally:
+                self.after(1, lambda: setattr(self, "chat_selection_sync", False))
 
     # ==========================================
     # КЛИЕНТ 360 (таймлайн)
