@@ -183,6 +183,71 @@ class ISPAutomationSystem(ctk.CTk):
         modal.wait_window()
         return result["value"]
 
+    def open_customer_search_modal(self, target_attr, label_attr):
+        if not self.conn:
+            return
+        modal = self.open_modal("Выбор клиента", "760x520")
+        box = ctk.CTkFrame(modal)
+        box.pack(fill="both", expand=True, padx=16, pady=16)
+        box.grid_columnconfigure(0, weight=1)
+        box.grid_rowconfigure(1, weight=1)
+
+        search = ctk.CTkEntry(box, placeholder_text="Поиск по ФИО, телефону или адресу", height=36)
+        search.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+
+        tree = ttk.Treeview(box, columns=("id", "name", "phone", "address"), show="headings", height=14)
+        tree.heading("id", text="ID")
+        tree.heading("name", text="ФИО")
+        tree.heading("phone", text="Телефон")
+        tree.heading("address", text="Адрес")
+        tree["displaycolumns"] = ("name", "phone", "address")
+        tree.column("name", width=240)
+        tree.column("phone", width=140)
+        tree.column("address", width=320)
+        tree.grid(row=1, column=0, sticky="nsew")
+
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT customer_id, name, phone, address FROM customers ORDER BY name")
+        rows = cursor.fetchall()
+        cursor.close()
+
+        def render():
+            q = search.get().strip().lower()
+            for item in tree.get_children():
+                tree.delete(item)
+            for row in rows:
+                row_text = " ".join(str(x or "").lower() for x in row)
+                if q and q not in row_text:
+                    continue
+                tree.insert("", "end", iid=str(row[0]), values=row)
+
+        def choose():
+            selection = tree.selection()
+            if not selection:
+                messagebox.showinfo("Клиент", "Выберите клиента в списке.")
+                return
+            values = tree.item(selection[0], "values")
+            customer_id = int(values[0])
+            customer_name = values[1]
+            customer_phone = values[2]
+            setattr(self, target_attr, customer_id)
+            label = getattr(self, label_attr, None)
+            if label:
+                label.configure(text=f"{customer_name}  |  {customer_phone}", text_color="#ffffff")
+            modal.destroy()
+
+        search.bind("<KeyRelease>", lambda _e: render())
+        search.bind("<Return>", lambda _e: choose())
+        tree.bind("<Double-1>", lambda _e: choose())
+
+        actions = ctk.CTkFrame(box, fg_color="transparent")
+        actions.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        ctk.CTkButton(actions, text="Выбрать", fg_color="#1f6aa5", width=130, command=choose).pack(side="left", padx=(0, 8))
+        ctk.CTkButton(actions, text="Отмена", width=110, command=modal.destroy).pack(side="left")
+
+        render()
+        search.focus_set()
+
     def select_frame(self, name):
         if name != "chat":
             self.stop_chat_polling()
@@ -222,7 +287,7 @@ class ISPAutomationSystem(ctk.CTk):
         self.frames["dashboard"] = frame
         ctk.CTkLabel(frame, text="Панель управления", font=ctk.CTkFont(size=24, weight="bold")).pack(anchor="w",
                                                                                                      pady=(0, 20))
-        stats_grid = ctk.CTkFrame(frame, fg_color="transparent")
+        stats_grid = ctk.CTkFrame(frame, fg_color="#2b2b2b", corner_radius=6, border_width=1, border_color="#3a3a3a")
         stats_grid.pack(fill="x", pady=(0, 20))
         self.stat_card(stats_grid, "Всего клиентов", "0", 0, 0)
         self.stat_card(stats_grid, "Активных клиентов", "0", 0, 1)
@@ -242,12 +307,18 @@ class ISPAutomationSystem(ctk.CTk):
         self.activity_tree.pack(fill="both", expand=True)
 
     def stat_card(self, parent, title, value, row, col):
-        card = ctk.CTkFrame(parent)
-        card.grid(row=row, column=col, padx=10, pady=10, sticky="ew")
+        card = ctk.CTkFrame(parent, fg_color="#242424", corner_radius=4)
+        card.grid(row=row, column=col, padx=8, pady=8, sticky="ew")
         parent.grid_columnconfigure(col, weight=1)
-        ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=14)).pack(padx=10, pady=(10, 0))
-        value_lbl = ctk.CTkLabel(card, text=value, font=ctk.CTkFont(size=20, weight="bold"))
-        value_lbl.pack(padx=10, pady=(5, 10))
+        card.grid_columnconfigure(0, weight=1)
+        card.grid_columnconfigure(1, weight=0)
+
+        ctk.CTkLabel(card, text=title, font=ctk.CTkFont(size=13), text_color="#cfd6df").grid(
+            row=0, column=0, sticky="w", padx=14, pady=(12, 2))
+        value_lbl = ctk.CTkLabel(card, text=value, font=ctk.CTkFont(size=24, weight="bold"), text_color="#ffffff")
+        value_lbl.grid(row=0, column=1, rowspan=2, sticky="e", padx=14, pady=10)
+        ctk.CTkFrame(card, height=2, fg_color="#1f6aa5", corner_radius=0).grid(
+            row=1, column=0, sticky="ew", padx=14, pady=(8, 12))
         setattr(self, f"stat_{title.replace(' ', '_')}", value_lbl)
 
     def update_dashboard_stats(self):
@@ -313,7 +384,18 @@ class ISPAutomationSystem(ctk.CTk):
 
         columns = ('id', 'name', 'address', 'phone', 'ip', 'plan')
         self.cust_tree = ttk.Treeview(frame, columns=columns, show='headings')
-        for col in columns: self.cust_tree.heading(col, text=col.upper())
+        self.cust_tree.heading('id', text='ID')
+        self.cust_tree.heading('name', text='ФИО')
+        self.cust_tree.heading('address', text='Адрес')
+        self.cust_tree.heading('phone', text='Телефон')
+        self.cust_tree.heading('ip', text='IP роутера')
+        self.cust_tree.heading('plan', text='Тариф')
+        self.cust_tree["displaycolumns"] = ('name', 'address', 'phone', 'ip', 'plan')
+        self.cust_tree.column('name', width=220)
+        self.cust_tree.column('address', width=360)
+        self.cust_tree.column('phone', width=150)
+        self.cust_tree.column('ip', width=120)
+        self.cust_tree.column('plan', width=180)
         self.cust_tree.bind("<Double-1>", self.edit_customer_on_click)
         self.cust_tree.pack(fill="both", expand=True)
 
@@ -419,8 +501,8 @@ class ISPAutomationSystem(ctk.CTk):
 
         results_tree = ttk.Treeview(layout, columns=("address", "lat", "lon"), show="headings")
         results_tree.heading("address", text="Адрес")
-        results_tree.heading("lat", text="Lat")
-        results_tree.heading("lon", text="Lon")
+        results_tree.heading("lat", text="Широта")
+        results_tree.heading("lon", text="Долгота")
         results_tree.column("address", width=520)
         results_tree.column("lat", width=90)
         results_tree.column("lon", width=90)
@@ -662,7 +744,14 @@ class ISPAutomationSystem(ctk.CTk):
         form_frame.grid_columnconfigure((0, 1, 2), weight=1)
         columns = ('id', 'name', 'speed', 'price')
         self.plans_tree = ttk.Treeview(frame, columns=columns, show='headings')
-        for col in columns: self.plans_tree.heading(col, text=col.upper())
+        self.plans_tree.heading('id', text='ID')
+        self.plans_tree.heading('name', text='Название')
+        self.plans_tree.heading('speed', text='Скорость')
+        self.plans_tree.heading('price', text='Цена')
+        self.plans_tree["displaycolumns"] = ('name', 'speed', 'price')
+        self.plans_tree.column('name', width=360)
+        self.plans_tree.column('speed', width=180)
+        self.plans_tree.column('price', width=140)
         self.plans_tree.bind("<Double-1>", self.edit_plan_on_click)
         self.plans_tree.pack(fill="both", expand=True)
 
@@ -746,8 +835,11 @@ class ISPAutomationSystem(ctk.CTk):
         self.frames["complaints"] = frame
         form_frame = ctk.CTkFrame(frame)
         form_frame.pack(fill="x", pady=(0, 20))
-        self.comp_cust = ctk.CTkComboBox(form_frame, width=300, values=["Выберите клиента"])
-        self.comp_cust.pack(padx=10, pady=10)
+        self.selected_complaint_customer_id = None
+        self.comp_customer_label = ctk.CTkLabel(form_frame, text="Клиент не выбран", text_color="gray")
+        self.comp_customer_label.pack(padx=10, pady=(10, 4))
+        ctk.CTkButton(form_frame, text="Найти клиента", width=220,
+                      command=lambda: self.open_customer_search_modal("selected_complaint_customer_id", "comp_customer_label")).pack(padx=10, pady=(0, 10))
         self.comp_desc = ctk.CTkEntry(form_frame, width=300, placeholder_text="Описание проблемы")
         self.comp_desc.pack(padx=10, pady=10)
         ctk.CTkButton(form_frame, text="Создать тикет", command=self.add_complaint).pack(pady=10)
@@ -768,15 +860,22 @@ class ISPAutomationSystem(ctk.CTk):
 
         columns = ('id', 'customer', 'desc', 'status', 'date')
         self.comp_tree = ttk.Treeview(frame, columns=columns, show='headings')
-        for col in columns: self.comp_tree.heading(col, text=col.upper())
+        self.comp_tree.heading('id', text='ID')
+        self.comp_tree.heading('customer', text='Клиент')
+        self.comp_tree.heading('desc', text='Описание')
+        self.comp_tree.heading('status', text='Статус')
+        self.comp_tree.heading('date', text='Дата')
+        self.comp_tree["displaycolumns"] = ('customer', 'desc', 'status', 'date')
+        self.comp_tree.column('customer', width=220)
+        self.comp_tree.column('desc', width=420)
+        self.comp_tree.column('status', width=140)
+        self.comp_tree.column('date', width=160)
         self.comp_tree.bind("<Double-1>", self.edit_complaint_on_click)
         self.comp_tree.pack(fill="both", expand=True)
 
     def load_complaints(self):
         if not self.conn: return
         cursor = self.conn.cursor()
-        cursor.execute("SELECT customer_id, name FROM customers")
-        self.comp_cust.configure(values=[f"{c[0]} - {c[1]}" for c in cursor.fetchall()])
         cursor.execute(
             "SELECT co.complaint_id, c.name, co.description, co.status, co.date FROM complaints co JOIN customers c ON co.customer_id = c.customer_id")
         self.complaints_rows = cursor.fetchall()
@@ -784,8 +883,10 @@ class ISPAutomationSystem(ctk.CTk):
         cursor.close()
 
     def add_complaint(self):
-        if ' - ' not in self.comp_cust.get(): return
-        cust_id = int(self.comp_cust.get().split(' - ')[0])
+        cust_id = self.selected_complaint_customer_id
+        if not cust_id:
+            messagebox.showinfo("Клиент", "Сначала выберите клиента через поиск.")
+            return
         cursor = self.conn.cursor()
         cursor.execute("INSERT INTO complaints (customer_id, description, status, date) VALUES (%s, %s, %s, %s)",
                        (cust_id, self.comp_desc.get(), 'Открыто', datetime.now()))
@@ -866,8 +967,14 @@ class ISPAutomationSystem(ctk.CTk):
         self.frames["billing"] = frame
         form_frame = ctk.CTkFrame(frame)
         form_frame.pack(fill="x", pady=(0, 20))
-        self.bill_cust = ctk.CTkComboBox(form_frame, values=["Выберите клиента"])
-        self.bill_cust.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        self.selected_bill_customer_id = None
+        bill_customer_box = ctk.CTkFrame(form_frame, fg_color="transparent")
+        bill_customer_box.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        bill_customer_box.grid_columnconfigure(0, weight=1)
+        self.bill_customer_label = ctk.CTkLabel(bill_customer_box, text="Клиент не выбран", text_color="gray")
+        self.bill_customer_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ctk.CTkButton(bill_customer_box, text="Найти клиента", width=140,
+                      command=lambda: self.open_customer_search_modal("selected_bill_customer_id", "bill_customer_label")).grid(row=0, column=1, sticky="e")
         self.bill_amount = ctk.CTkEntry(form_frame, placeholder_text="Сумма")
         self.bill_amount.grid(row=0, column=1, padx=10, pady=10, sticky="ew")
         ctk.CTkButton(form_frame, text="Выставить счёт", command=self.generate_bill).grid(row=1, column=0, padx=10,
@@ -895,14 +1002,21 @@ class ISPAutomationSystem(ctk.CTk):
 
         columns = ('id', 'customer', 'amount', 'due_date', 'status')
         self.bills_tree = ttk.Treeview(frame, columns=columns, show='headings')
-        for col in columns: self.bills_tree.heading(col, text=col.upper())
+        self.bills_tree.heading('id', text='ID')
+        self.bills_tree.heading('customer', text='Клиент')
+        self.bills_tree.heading('amount', text='Сумма')
+        self.bills_tree.heading('due_date', text='Срок оплаты')
+        self.bills_tree.heading('status', text='Статус')
+        self.bills_tree["displaycolumns"] = ('customer', 'amount', 'due_date', 'status')
+        self.bills_tree.column('customer', width=240)
+        self.bills_tree.column('amount', width=120)
+        self.bills_tree.column('due_date', width=160)
+        self.bills_tree.column('status', width=120)
         self.bills_tree.pack(fill="both", expand=True)
 
     def load_bills(self):
         if not self.conn: return
         cursor = self.conn.cursor()
-        cursor.execute("SELECT customer_id, name FROM customers")
-        self.bill_cust.configure(values=[f"{c[0]} - {c[1]}" for c in cursor.fetchall()])
         cursor.execute(
             "SELECT b.bill_id, c.name, b.amount, b.due_date, CASE WHEN b.paid = 1 THEN 'Оплачен' ELSE 'Долг' END FROM billing b JOIN customers c ON b.customer_id = c.customer_id ORDER BY b.due_date DESC")
         self.bills_rows = cursor.fetchall()
@@ -910,8 +1024,10 @@ class ISPAutomationSystem(ctk.CTk):
         cursor.close()
 
     def generate_bill(self):
-        if ' - ' not in self.bill_cust.get(): return
-        cust_id = int(self.bill_cust.get().split(' - ')[0])
+        cust_id = self.selected_bill_customer_id
+        if not cust_id:
+            messagebox.showinfo("Клиент", "Сначала выберите клиента через поиск.")
+            return
         cursor = self.conn.cursor()
         cursor.execute("INSERT INTO billing (customer_id, amount, due_date, paid) VALUES (%s, %s, %s, 0)",
                        (cust_id, float(self.bill_amount.get()), datetime.now() + timedelta(days=30)))
@@ -1059,7 +1175,7 @@ class ISPAutomationSystem(ctk.CTk):
         self.chat_tree = ttk.Treeview(container, columns=('name', 'phone', 'unread'), show='headings', height=25)
         self.chat_tree.heading('name', text='Клиент')
         self.chat_tree.heading('phone', text='Телефон')
-        self.chat_tree.heading('unread', text='Непр.')
+        self.chat_tree.heading('unread', text='Непрочитано')
         self.chat_tree.column('name', width=160)
         self.chat_tree.column('phone', width=110)
         self.chat_tree.column('unread', width=60, anchor='center')
@@ -1378,6 +1494,7 @@ class ISPAutomationSystem(ctk.CTk):
         self.ss_tree.heading("payload", text="Данные")
         self.ss_tree.heading("status", text="Статус")
         self.ss_tree.heading("comment", text="Комментарий")
+        self.ss_tree["displaycolumns"] = ("date", "customer", "type", "payload", "status", "comment")
         self.ss_tree.column("id", width=50)
         self.ss_tree.column("date", width=130)
         self.ss_tree.column("customer_id", width=60)
@@ -1895,7 +2012,7 @@ class ISPAutomationSystem(ctk.CTk):
 
         self.network_nodes_tree = ttk.Treeview(content, columns=("house_id", "address", "clients", "active", "status"), show="headings", height=9)
         for col, title, width in [
-            ("house_id", "\u0414\u043e\u043c ID", 70),
+            ("house_id", "ID", 70),
             ("address", "\u0410\u0434\u0440\u0435\u0441", 340),
             ("clients", "\u041a\u043b\u0438\u0435\u043d\u0442\u043e\u0432", 90),
             ("active", "\u0410\u0432\u0430\u0440\u0438\u0439", 80),
@@ -1903,13 +2020,14 @@ class ISPAutomationSystem(ctk.CTk):
         ]:
             self.network_nodes_tree.heading(col, text=title)
             self.network_nodes_tree.column(col, width=width)
+        self.network_nodes_tree["displaycolumns"] = ("address", "clients", "active", "status")
         self.network_nodes_tree.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=(0, 6))
         self.network_nodes_tree.bind("<<TreeviewSelect>>", self.on_select_network_node)
 
         self.network_incidents_tree = ttk.Treeview(content, columns=("id", "house", "title", "desc", "severity", "status", "clients", "started"), show="headings", height=9)
         for col, title, width in [
             ("id", "ID", 50),
-            ("house", "\u0414\u043e\u043c", 90),
+            ("house", "Дом ID", 90),
             ("title", "\u0410\u0432\u0430\u0440\u0438\u044f", 170),
             ("desc", "\u041e\u043f\u0438\u0441\u0430\u043d\u0438\u0435", 220),
             ("severity", "\u041a\u0440\u0438\u0442\u0438\u0447.", 90),
@@ -1919,6 +2037,7 @@ class ISPAutomationSystem(ctk.CTk):
         ]:
             self.network_incidents_tree.heading(col, text=title)
             self.network_incidents_tree.column(col, width=width)
+        self.network_incidents_tree["displaycolumns"] = ("title", "desc", "severity", "status", "clients", "started")
         self.network_incidents_tree.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=(0, 6))
 
         self.network_map_host = ctk.CTkFrame(content, fg_color="#10151d", corner_radius=8)
@@ -1948,6 +2067,7 @@ class ISPAutomationSystem(ctk.CTk):
         self.network_affected_tree.heading("id", text="CID")
         self.network_affected_tree.heading("name", text="\u041a\u043b\u0438\u0435\u043d\u0442")
         self.network_affected_tree.heading("phone", text="\u0422\u0435\u043b\u0435\u0444\u043e\u043d")
+        self.network_affected_tree["displaycolumns"] = ("name", "phone")
         self.network_affected_tree.column("id", width=60)
         self.network_affected_tree.column("name", width=220)
         self.network_affected_tree.column("phone", width=140)
